@@ -1,0 +1,55 @@
+name: Telegram Pixeldrain Bot
+
+# Запускаешь workflow вручную -> бот поднимается и слушает Telegram.
+# Открываешь чат с ботом, присылаешь ссылку на файл -> бот показывает прогресс
+# скачивания (aria2c) и загрузки (pixeldrain), в конце присылает ссылку.
+#
+# Если бот не получает сообщений дольше IDLE_TIMEOUT_SECONDS - job завершается
+# сам, чтобы не тратить впустую минуты Actions.
+on:
+  workflow_dispatch:
+    inputs:
+      idle_timeout_minutes:
+        description: "Через сколько минут без сообщений бот завершится"
+        required: false
+        type: string
+        default: "10"
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # общий потолок job'а (лимит free-раннера - 6 часов)
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS }}
+      PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+      IDLE_TIMEOUT_SECONDS: ${{ fromJSON(github.event.inputs.idle_timeout_minutes) * 60 }}
+      HARD_TIMEOUT_SECONDS: 20400   # ~340 минут, чуть меньше timeout-minutes выше
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Проверка секретов
+        run: |
+          missing=0
+          [ -z "$TELEGRAM_BOT_TOKEN" ] && echo "::error::Секрет TELEGRAM_BOT_TOKEN не задан" && missing=1
+          [ -z "$PIXELDRAIN_API_KEY" ] && echo "::error::Секрет PIXELDRAIN_API_KEY не задан" && missing=1
+          if [ -z "$TELEGRAM_ALLOWED_CHAT_IDS" ]; then
+            echo "::warning::Секрет TELEGRAM_ALLOWED_CHAT_IDS не задан - ботом сможет пользоваться кто угодно, кто его найдёт. Рекомендуется задать свой chat_id."
+          fi
+          if [ "$missing" = "1" ]; then
+            exit 1
+          fi
+
+      - name: Установка Python и системных зависимостей
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y aria2 python3 python3-pip
+
+      - name: Установка Python-зависимостей
+        run: pip install --no-cache-dir requests
+
+      - name: Запуск бота
+        run: python3 scripts/pixeldrain_bot.py
