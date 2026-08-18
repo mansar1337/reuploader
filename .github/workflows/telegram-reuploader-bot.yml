@@ -16,6 +16,13 @@ on:
         type: string
         default: "10"
 
+# Если запустить workflow ещё раз, пока предыдущий бот ещё работает,
+# GitHub автоматически отменит старый запуск - это предотвращает конфликт
+# "Conflict: terminated by other getUpdates request" между двумя ботами.
+concurrency:
+  group: telegram-reuploader-bot
+  cancel-in-progress: true
+
 jobs:
   bot:
     runs-on: ubuntu-latest
