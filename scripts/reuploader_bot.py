@@ -765,6 +765,13 @@ def main():
     if not PIXELDRAIN_API_KEY:
         print("Секрет PIXELDRAIN_API_KEY не задан - опция Pixeldrain будет недоступна.", file=sys.stderr)
 
+    # На случай, если для бота когда-либо был настроен webhook - он мешает
+    # long polling'у (getUpdates) и вызывает конфликт. Сбрасываем его на всякий случай.
+    try:
+        tg_call("deleteWebhook", drop_pending_updates="false")
+    except Exception as e:
+        print(f"Не удалось сбросить webhook (не критично): {e}")
+
     print("Запускаю aria2c...")
     start_aria2c()
 
@@ -788,8 +795,12 @@ def main():
 
             try:
                 updates = get_updates(offset)
-            except requests.RequestException as e:
-                print(f"Ошибка сети при опросе Telegram: {e}, повтор через 5с")
+            except Exception as e:
+                if "Conflict" in str(e) or "terminated by other" in str(e):
+                    print(f"Конфликт с другим запущенным экземпляром бота (вероятно, предыдущий запуск ещё "
+                          f"не остановился): {e}. Повтор через 5с.")
+                else:
+                    print(f"Ошибка при опросе Telegram: {e}, повтор через 5с")
                 time.sleep(5)
                 continue
 
