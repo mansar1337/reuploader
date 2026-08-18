@@ -16,7 +16,8 @@ Telegram-бот для перезалива файлов на VikingFile или 
 при этом может провиснуть; если хостинг оборвёт его при долгой паузе, бот
 предложит повторить загрузку.
 
-Если новых сообщений нет дольше IDLE_TIMEOUT минут — бот завершает работу.
+Если новых сообщений нет дольше IDLE_TIMEOUT минут — бот завершает работу
+(IDLE_TIMEOUT_MINUTES=0 или HARD_TIMEOUT_SECONDS=0 отключает соответствующий лимит).
 Команда /stop в чате завершает работу бота целиком (не путать с кнопкой "Стоп",
 которая останавливает только текущую задачу).
 """
@@ -48,8 +49,11 @@ ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
 
-IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "10")) * 60
-HARD_TIMEOUT = int(os.environ.get("HARD_TIMEOUT_SECONDS", "20400"))
+# 0 или отрицательное значение = таймаут отключён (бот не завершается сам)
+_idle_min = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "10"))
+IDLE_TIMEOUT = _idle_min * 60 if _idle_min > 0 else 0
+_hard_sec = int(os.environ.get("HARD_TIMEOUT_SECONDS", "20400"))
+HARD_TIMEOUT = _hard_sec if _hard_sec > 0 else 0
 
 DOWNLOAD_DIR = os.path.abspath("downloads")
 ARIA2_RPC_PORT = 6800
@@ -795,12 +799,18 @@ def main():
     offset = 0
     print("Бот запущен, жду сообщений в Telegram...")
 
+    # Сбрасываем таймер активности уже после старта aria2c и webhook,
+    # иначе при IDLE_TIMEOUT_MINUTES=0 (или очень маленьком) бот сразу
+    # завершается, не успев сделать даже первый long-poll.
+    global last_activity_time
+    last_activity_time = time.time()
+
     try:
         while not should_stop_bot.is_set():
-            if time.time() - start_time > HARD_TIMEOUT:
+            if HARD_TIMEOUT and time.time() - start_time > HARD_TIMEOUT:
                 print("Достигнут общий лимит времени работы, завершаюсь.")
                 break
-            if time.time() - last_activity_time > IDLE_TIMEOUT:
+            if IDLE_TIMEOUT and time.time() - last_activity_time > IDLE_TIMEOUT:
                 print("Нет активности слишком долго, завершаюсь.")
                 break
 
