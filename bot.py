@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для перезалива файлов на pixeldrain.
+Telegram-бот для перезалива файлов на VikingFile.
 
 Логика:
   1. Бот поднимает aria2c в режиме RPC (для получения реального прогресса скачивания).
   2. Бот слушает Telegram через long polling (getUpdates).
   3. Пользователь присылает боту ссылку на файл.
   4. Бот скачивает файл через aria2c, редактируя сообщение с прогрессом.
-  5. Бот заливает скачанный файл на pixeldrain (PUT /api/file/{name}), тоже с прогрессом.
-  6. Бот присылает финальную ссылку на pixeldrain.
+  5. Бот заливает скачанный файл на vikingfile.com (multipart upload), тоже с прогрессом.
+  6. Бот присылает финальную ссылку на файл.
 
 Если новых сообщений нет дольше IDLE_TIMEOUT секунд — бот завершает работу
 (чтобы не держать job GitHub Actions запущенным вечно).
@@ -24,24 +24,24 @@ import shutil
 import signal
 import threading
 import subprocess
-from urllib.parse import quote
+from html import escape as html_escape
 
 import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
 # ---------------------------------------------------------------------------
 # Конфигурация из переменных окружения
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-PIXELDRAIN_API_KEY = os.environ["PIXELDRAIN_API_KEY"]
+VIKINGFILE_USER_HASH = os.environ.get("VIKINGFILE_USER_HASH", "")  # пусто = анонимная загрузка
 
 # Список разрешённых chat_id через запятую, например "123456789,987654321"
-# Если не задано - бот откажется стартовать (чтобы им не мог пользоваться кто попало).
 ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
 
-IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "10")) * 60   # минуты без сообщений -> выход (в секундах)
+IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "10")) * 60    # минуты без сообщений -> выход
 HARD_TIMEOUT = int(os.environ.get("HARD_TIMEOUT_SECONDS", "20400"))     # общий потолок на весь job (~340 мин)
 
 DOWNLOAD_DIR = os.path.abspath("downloads")
@@ -52,6 +52,7 @@ ARIA2_RPC_URL = f"http://127.0.0.1:{ARIA2_RPC_PORT}/jsonrpc"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 URL_RE = re.compile(r"https?://\S+")
+UPLOAD_RETRIES = 3
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -74,14 +75,17 @@ def tg_call(method, **params):
 
 
 def send_message(chat_id, text, **kwargs):
+    kwargs.setdefault("parse_mode", "HTML")
+    kwargs.setdefault("disable_web_page_preview", True)
     return tg_call("sendMessage", chat_id=chat_id, text=text, **kwargs)
 
 
 def edit_message(chat_id, message_id, text, **kwargs):
+    kwargs.setdefault("parse_mode", "HTML")
+    kwargs.setdefault("disable_web_page_preview", True)
     try:
         return tg_call("editMessageText", chat_id=chat_id, message_id=message_id, text=text, **kwargs)
     except RuntimeError as e:
-        # Telegram кидает ошибку, если текст не изменился - это не страшно, игнорируем
         if "message is not modified" in str(e):
             return None
         raise
@@ -101,7 +105,7 @@ def get_updates(offset):
 
 
 # ---------------------------------------------------------------------------
-# Прогресс-бар
+# Визуал: прогресс-бары, форматирование
 # ---------------------------------------------------------------------------
 
 def human_size(n):
@@ -113,30 +117,59 @@ def human_size(n):
     return f"{n:.1f} ПБ"
 
 
-def progress_bar(fraction, width=20):
+def human_time(seconds):
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}ч {m:02d}м {s:02d}с"
+    if m:
+        return f"{m}м {s:02d}с"
+    return f"{s}с"
+
+
+def progress_bar(fraction, width=18):
     fraction = max(0.0, min(1.0, fraction))
     filled = int(width * fraction)
-    return "▓" * filled + "░" * (width - filled)
+    partial_chars = "▏▎▍▌▋▊▉"
+    remainder = (width * fraction) - filled
+    bar = "█" * filled
+    if filled < width and remainder > 0:
+        bar += partial_chars[int(remainder * len(partial_chars))]
+        filled += 1
+    bar += "░" * (width - filled)
+    return bar
 
 
-def render_progress(title, done, total, speed_bps, extra=""):
+def render_progress(icon, title, done, total, speed_bps, elapsed, extra_line=None):
     if total > 0:
         frac = done / total
-        pct = f"{frac * 100:.1f}%"
-        bar = progress_bar(frac)
+        pct = frac * 100
+        eta = (total - done) / speed_bps if speed_bps > 0 else None
     else:
-        pct = "?"
-        bar = progress_bar(0)
-    speed = f"{human_size(speed_bps)}/с" if speed_bps else "-"
-    text = (
-        f"{title}\n"
-        f"{bar} {pct}\n"
-        f"{human_size(done)} / {human_size(total) if total else '?'}\n"
-        f"Скорость: {speed}"
-    )
-    if extra:
-        text += f"\n{extra}"
-    return text
+        frac = 0
+        pct = 0
+        eta = None
+
+    bar = progress_bar(frac)
+    speed_str = f"{human_size(speed_bps)}/с" if speed_bps else "—"
+    eta_str = human_time(eta) if eta is not None else "—"
+
+    lines = [
+        f"{icon} <b>{title}</b>",
+        "",
+        f"<code>[{bar}] {pct:5.1f}%</code>",
+        f"📦 {human_size(done)} / {human_size(total) if total else '?'}",
+        f"⚡ {speed_str}   ⏳ ETA: {eta_str}",
+        f"🕐 Прошло: {human_time(elapsed)}",
+    ]
+    if extra_line:
+        lines.append(extra_line)
+    return "\n".join(lines)
+
+
+def divider():
+    return "━━━━━━━━━━━━━━━━━━"
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +202,6 @@ def start_aria2c():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    # ждём пока RPC поднимется
     for _ in range(50):
         try:
             aria2_rpc("aria2.getVersion")
@@ -219,6 +251,7 @@ def download_with_progress(url, chat_id, status_msg_id, custom_name=None):
 
     last_edit_text = None
     last_edit_time = 0
+    stage_start = time.time()
 
     while True:
         if should_stop.is_set():
@@ -238,7 +271,7 @@ def download_with_progress(url, chat_id, status_msg_id, custom_name=None):
 
         now = time.time()
         if now - last_edit_time >= 3:
-            text = render_progress("⬇️ Скачивание файла...", done, total, speed)
+            text = render_progress("⬇️", "Скачивание файла", done, total, speed, now - stage_start)
             if text != last_edit_text:
                 edit_message(chat_id, status_msg_id, text)
                 last_edit_text = text
@@ -255,71 +288,88 @@ def download_with_progress(url, chat_id, status_msg_id, custom_name=None):
 
 
 # ---------------------------------------------------------------------------
-# Загрузка на pixeldrain
+# Загрузка на VikingFile
 # ---------------------------------------------------------------------------
 
-class ProgressFileReader:
-    """Обёртка над файлом, которая считает прочитанные байты для прогресс-бара."""
-
-    def __init__(self, path, on_progress):
-        self._f = open(path, "rb")
-        self._size = os.fstat(self._f.fileno()).st_size
-        self._read = 0
-        self._on_progress = on_progress
-
-    def __len__(self):
-        return self._size
-
-    def read(self, size=-1):
-        chunk = self._f.read(size)
-        self._read += len(chunk)
-        self._on_progress(self._read, self._size)
-        return chunk
-
-    def close(self):
-        self._f.close()
+def get_vikingfile_upload_server():
+    resp = requests.get("https://vikingfile.com/api/get-server", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    server = data.get("server")
+    if not server:
+        raise RuntimeError(f"VikingFile не вернул адрес сервера загрузки: {data}")
+    return server
 
 
-def upload_to_pixeldrain(file_path, chat_id, status_msg_id):
+def upload_to_vikingfile_once(file_path, chat_id, status_msg_id, stage_start):
+    server_url = get_vikingfile_upload_server()
     file_name = os.path.basename(file_path)
-    encoded_name = quote(file_name)
+    file_size = os.path.getsize(file_path)
 
-    progress_state = {"done": 0, "total": os.path.getsize(file_path), "last_edit": 0}
+    fh = open(file_path, "rb")
+    encoder = MultipartEncoder(fields={
+        "file": (file_name, fh, "application/octet-stream"),
+        "user": VIKINGFILE_USER_HASH,
+    })
 
-    def on_progress(done, total):
-        progress_state["done"] = done
-        progress_state["total"] = total
+    state = {"last_edit": 0, "last_done": 0, "last_time": time.time()}
+
+    def progress_callback(monitor):
         now = time.time()
-        if now - progress_state["last_edit"] >= 3:
-            text = render_progress("⬆️ Загрузка на pixeldrain...", done, total, 0)
-            edit_message(chat_id, status_msg_id, text)
-            progress_state["last_edit"] = now
+        if now - state["last_edit"] < 3:
+            return
+        done = monitor.bytes_read
+        dt = now - state["last_time"]
+        speed = (done - state["last_done"]) / dt if dt > 0 else 0
+        text = render_progress("⬆️", "Загрузка на VikingFile", done, monitor.len, speed, now - stage_start)
+        edit_message(chat_id, status_msg_id, text)
+        state["last_edit"] = now
+        state["last_done"] = done
+        state["last_time"] = now
 
-    reader = ProgressFileReader(file_path, on_progress)
+    monitor = MultipartEncoderMonitor(encoder, progress_callback)
+
     try:
-        resp = requests.put(
-            f"https://pixeldrain.com/api/file/{encoded_name}",
-            data=reader,
-            headers={"Content-Length": str(len(reader))},
-            auth=("", PIXELDRAIN_API_KEY),
-            timeout=None,
+        resp = requests.post(
+            server_url,
+            data=monitor,
+            headers={"Content-Type": monitor.content_type},
+            timeout=(30, None),
         )
     finally:
-        reader.close()
+        fh.close()
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"Ошибка pixeldrain ({resp.status_code}): {resp.text}")
+        raise RuntimeError(f"Ошибка VikingFile ({resp.status_code}): {resp.text[:300]}")
 
     data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Ошибка pixeldrain: {data}")
+    if not data.get("url"):
+        raise RuntimeError(f"Ошибка VikingFile: {data}")
 
-    file_id = data["id"]
     return {
-        "id": file_id,
-        "view_url": f"https://pixeldrain.com/u/{file_id}",
-        "direct_url": f"https://pixeldrain.com/api/file/{file_id}",
+        "name": data.get("name", file_name),
+        "size": data.get("size", file_size),
+        "hash": data.get("hash"),
+        "url": data["url"],
     }
+
+
+def upload_to_vikingfile(file_path, chat_id, status_msg_id):
+    stage_start = time.time()
+    last_error = None
+    for attempt in range(1, UPLOAD_RETRIES + 1):
+        try:
+            return upload_to_vikingfile_once(file_path, chat_id, status_msg_id, stage_start)
+        except (requests.RequestException, RuntimeError) as e:
+            last_error = e
+            if attempt < UPLOAD_RETRIES:
+                edit_message(
+                    chat_id, status_msg_id,
+                    f"⚠️ Сбой сети при загрузке (попытка {attempt}/{UPLOAD_RETRIES}), пробую снова...\n"
+                    f"<code>{html_escape(str(e))[:200]}</code>"
+                )
+                time.sleep(5 * attempt)
+    raise RuntimeError(f"Не удалось загрузить после {UPLOAD_RETRIES} попыток: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -327,31 +377,45 @@ def upload_to_pixeldrain(file_path, chat_id, status_msg_id):
 # ---------------------------------------------------------------------------
 
 def process_link(chat_id, url):
-    status = send_message(chat_id, f"🔗 Принял ссылку:\n{url}\n\nНачинаю скачивание...")
+    task_start = time.time()
+    status = send_message(
+        chat_id,
+        f"🔗 <b>Принял ссылку</b>\n<code>{html_escape(url)}</code>\n\n⏳ Начинаю скачивание..."
+    )
     status_msg_id = status["message_id"]
 
     file_path = None
     try:
         file_path = download_with_progress(url, chat_id, status_msg_id)
-
         size = os.path.getsize(file_path)
+
         edit_message(
             chat_id, status_msg_id,
-            f"✅ Скачано: {os.path.basename(file_path)} ({human_size(size)})\n\n⬆️ Начинаю загрузку на pixeldrain..."
+            f"✅ <b>Скачивание завершено</b>\n"
+            f"📄 <code>{html_escape(os.path.basename(file_path))}</code>\n"
+            f"📦 {human_size(size)}\n\n"
+            f"⬆️ Начинаю загрузку на VikingFile..."
         )
 
-        result = upload_to_pixeldrain(file_path, chat_id, status_msg_id)
+        result = upload_to_vikingfile(file_path, chat_id, status_msg_id)
+        total_time = time.time() - task_start
 
         edit_message(
             chat_id, status_msg_id,
-            "✅ Готово!\n\n"
-            f"Файл: {os.path.basename(file_path)} ({human_size(size)})\n\n"
-            f"🔗 Ссылка: {result['view_url']}\n"
-            f"⬇️ Прямая ссылка: {result['direct_url']}"
+            "🎉 <b>Готово!</b>\n"
+            f"{divider()}\n"
+            f"📄 <b>Файл:</b> <code>{html_escape(result['name'])}</code>\n"
+            f"📦 <b>Размер:</b> {human_size(result['size'])}\n"
+            f"🕐 <b>Затрачено времени:</b> {human_time(total_time)}\n"
+            f"{divider()}\n"
+            f"🔗 <b>Ссылка:</b> {result['url']}"
         )
 
     except Exception as e:
-        edit_message(chat_id, status_msg_id, f"❌ Ошибка: {e}")
+        edit_message(
+            chat_id, status_msg_id,
+            f"❌ <b>Ошибка</b>\n<code>{html_escape(str(e))[:500]}</code>"
+        )
     finally:
         if file_path and os.path.exists(file_path):
             try:
@@ -383,20 +447,22 @@ def handle_update(update):
     if text in ("/start", "/help"):
         send_message(
             chat_id,
-            "Привет! Пришли мне ссылку на файл, и я перезалью его на pixeldrain.\n\n"
-            "Команды:\n"
-            "/stop - завершить работу бота"
+            "👋 <b>Привет!</b>\n\n"
+            "Пришли мне ссылку на файл — я скачаю его и перезалью на "
+            "<a href=\"https://vikingfile.com\">VikingFile</a>.\n\n"
+            "⚙️ <b>Команды</b>\n"
+            "/stop — завершить работу бота"
         )
         return
 
     if text == "/stop":
-        send_message(chat_id, "Останавливаюсь...")
+        send_message(chat_id, "🛑 Останавливаюсь...")
         should_stop.set()
         return
 
     match = URL_RE.search(text)
     if not match:
-        send_message(chat_id, "Пришли, пожалуйста, ссылку на файл (начинается с http:// или https://).")
+        send_message(chat_id, "📎 Пришли, пожалуйста, ссылку на файл (начинается с http:// или https://).")
         return
 
     url = match.group(0)
