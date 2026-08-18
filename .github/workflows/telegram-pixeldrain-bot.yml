@@ -4,7 +4,7 @@ name: Telegram Pixeldrain Bot
 # Открываешь чат с ботом, присылаешь ссылку на файл -> бот показывает прогресс
 # скачивания (aria2c) и загрузки (pixeldrain), в конце присылает ссылку.
 #
-# Если бот не получает сообщений дольше IDLE_TIMEOUT_SECONDS - job завершается
+# Если бот не получает сообщений дольше idle_timeout_minutes - job завершается
 # сам, чтобы не тратить впустую минуты Actions.
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-      IDLE_TIMEOUT_SECONDS: ${{ fromJSON(github.event.inputs.idle_timeout_minutes) * 60 }}
+      IDLE_TIMEOUT_MINUTES: ${{ github.event.inputs.idle_timeout_minutes }}
       HARD_TIMEOUT_SECONDS: 20400   # ~340 минут, чуть меньше timeout-minutes выше
 
     steps:
