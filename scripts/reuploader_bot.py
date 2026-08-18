@@ -59,7 +59,7 @@ ARIA2_RPC_URL = f"http://127.0.0.1:{ARIA2_RPC_PORT}/jsonrpc"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 URL_RE = re.compile(r"https?://\S+")
-UPLOAD_RETRIES = 3
+UPLOAD_RETRIES = 5
 
 DESTINATIONS = {
     "vikingfile": "VikingFile",
@@ -563,14 +563,25 @@ def upload_file(dest, file_path, chat_id, status_msg_id, task_id, control):
         except (requests.RequestException, RuntimeError) as e:
             last_error = e
             if attempt < UPLOAD_RETRIES:
+                wait_s = min(60, 8 * attempt)
                 edit_message(
                     chat_id, status_msg_id,
-                    f"⚠️ Сбой сети при загрузке (попытка {attempt}/{UPLOAD_RETRIES}), пробую снова...\n"
+                    f"⚠️ Сбой сети при загрузке (попытка {attempt}/{UPLOAD_RETRIES}), "
+                    f"пробую снова через {wait_s}с...\n"
                     f"<code>{html_escape(str(e))[:200]}</code>",
                     reply_markup=build_progress_keyboard(task_id, control),
                 )
-                time.sleep(5 * attempt)
-    raise RuntimeError(f"Не удалось загрузить после {UPLOAD_RETRIES} попыток: {last_error}")
+                time.sleep(wait_s)
+
+    hint = ""
+    if dest == "pixeldrain":
+        hint = (
+            "\n\n💡 Похоже, Pixeldrain систематически рвёт соединение (SSL EOF) - "
+            "это часто означает, что сервис ограничивает загрузку с IP-адресов "
+            "дата-центров/CI (какие использует GitHub Actions). Попробуй прислать "
+            "ссылку заново и выбрать <b>VikingFile</b> - он обычно стабильнее в такой среде."
+        )
+    raise RuntimeError(f"Не удалось загрузить после {UPLOAD_RETRIES} попыток: {last_error}{hint}")
 
 
 # ---------------------------------------------------------------------------
