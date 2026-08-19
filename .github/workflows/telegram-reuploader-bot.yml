@@ -38,6 +38,9 @@ jobs:
       TELEGRAM_ALLOWED_CHAT_IDS: ${{ secrets.TELEGRAM_ALLOWED_CHAT_IDS }}
       VIKINGFILE_USER_HASH: ${{ secrets.VIKINGFILE_USER_HASH }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+      FUCKINGFAST_TOKEN: ${{ secrets.FUCKINGFAST_TOKEN }}
+      BUZZHEAVIER_TOKEN: ${{ secrets.BUZZHEAVIER_TOKEN }}
+      GOFILE_API_TOKEN: ${{ secrets.GOFILE_API_TOKEN }}
       IDLE_TIMEOUT_MINUTES: ${{ github.event.inputs.idle_timeout_minutes }}
       PIXELDRAIN_MAX_SIZE_GB: ${{ github.event.inputs.pixeldrain_max_size_gb }}
       HARD_TIMEOUT_SECONDS: 20400   # ~340 минут, чуть меньше timeout-minutes выше
@@ -61,6 +64,9 @@ jobs:
           if [ -z "$PIXELDRAIN_API_KEY" ]; then
             echo "::notice::PIXELDRAIN_API_KEY не задан - опция Pixeldrain в боте будет недоступна."
           fi
+          # FuckingFast, BuzzHeavier и Gofile поддерживают анонимную загрузку,
+          # поэтому FUCKINGFAST_TOKEN / BUZZHEAVIER_TOKEN / GOFILE_API_TOKEN не обязательны -
+          # без них файлы просто не будут привязаны к аккаунту.
 
       - name: Установка системных зависимостей
         run: |
