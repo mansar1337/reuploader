@@ -32,6 +32,7 @@ import threading
 import subprocess
 import uuid
 from html import escape as html_escape
+from urllib.parse import quote
 
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
@@ -43,6 +44,9 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncod
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 VIKINGFILE_USER_HASH = os.environ.get("VIKINGFILE_USER_HASH", "")   # пусто = анонимная загрузка
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")       # нужен только если выбран Pixeldrain
+FUCKINGFAST_TOKEN = os.environ.get("FUCKINGFAST_TOKEN", "")         # опционально, для привязки к аккаунту
+BUZZHEAVIER_TOKEN = os.environ.get("BUZZHEAVIER_TOKEN", "")         # опционально, для привязки к аккаунту
+GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "")           # опционально, иначе гостевая загрузка
 
 ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()
@@ -75,6 +79,9 @@ UPLOAD_RETRIES = 5
 DESTINATIONS = {
     "vikingfile": "VikingFile",
     "pixeldrain": "Pixeldrain",
+    "fuckingfast": "FuckingFast",
+    "buzzheavier": "BuzzHeavier",
+    "gofile": "Gofile",
 }
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -187,21 +194,28 @@ def get_remote_file_size(url):
 
 
 def build_target_keyboard(token, file_size=None):
-    buttons = [{"text": "🦁 VikingFile", "callback_data": f"target|vikingfile|{token}"}]
+    row1 = [{"text": "🦁 VikingFile", "callback_data": f"target|vikingfile|{token}"}]
 
     pixeldrain_too_large = (
         file_size is not None
         and file_size > PIXELDRAIN_MAX_SIZE_BYTES
     )
     if pixeldrain_too_large:
-        buttons.append({
+        row1.append({
             "text": f"🟢 Pixeldrain ⛔ >{human_size(PIXELDRAIN_MAX_SIZE_BYTES)}",
             "callback_data": f"toolarge|pixeldrain|{token}",
         })
     else:
-        buttons.append({"text": "🟢 Pixeldrain", "callback_data": f"target|pixeldrain|{token}"})
+        row1.append({"text": "🟢 Pixeldrain", "callback_data": f"target|pixeldrain|{token}"})
 
-    return {"inline_keyboard": [buttons]}
+    row1.append({"text": "⚡ FuckingFast", "callback_data": f"target|fuckingfast|{token}"})
+
+    row2 = [
+        {"text": "🐝 BuzzHeavier", "callback_data": f"target|buzzheavier|{token}"},
+        {"text": "📁 Gofile", "callback_data": f"target|gofile|{token}"},
+    ]
+
+    return {"inline_keyboard": [row1, row2]}
 
 
 def build_progress_keyboard(task_id, control):
@@ -537,8 +551,6 @@ def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, contro
     if not PIXELDRAIN_API_KEY:
         raise RuntimeError("Секрет PIXELDRAIN_API_KEY не задан в репозитории.")
 
-    from urllib.parse import quote
-
     file_name = os.path.basename(file_path)
     encoded_name = quote(file_name)
 
@@ -584,12 +596,164 @@ def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, contro
 
 
 # ---------------------------------------------------------------------------
+# Загрузка на FuckingFast / BuzzHeavier
+# ---------------------------------------------------------------------------
+# Оба сервиса работают на одинаковой платформе: анонимная загрузка - это
+# простой PUT с телом файла на поддомен w.<домен>/{имя_файла}. Ответ сервера
+# в некоторых случаях приходит как JSON, а в некоторых - как обычный текст
+# со ссылкой (именно поэтому в официальных примерах его просто пишут в stdout
+# через `| cat`), так что разбираем оба варианта.
+
+def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    file_name = os.path.basename(file_path)
+    upload_url = f"https://w.{domain}/{quote(file_name)}"
+
+    state = {"last_edit": 0, "last_done": 0, "last_time": time.time()}
+
+    def on_progress(done, total, _speed, paused=False):
+        now = time.time()
+        if not paused and now - state["last_edit"] < 3:
+            return
+        dt = now - state["last_time"]
+        speed = (done - state["last_done"]) / dt if (dt > 0 and not paused) else 0
+        text = render_progress("⬆️", f"Загрузка на {display_name}", done, total, speed,
+                                now - stage_start, paused=paused)
+        edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
+        state["last_edit"] = now
+        state["last_done"] = done
+        state["last_time"] = now
+
+    reader = ControlledFileReader(file_path, control, on_progress)
+    headers = {"Content-Length": str(len(reader))}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        resp = requests.put(upload_url, data=reader, headers=headers, timeout=(30, None))
+    finally:
+        reader.close()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ошибка {display_name} ({resp.status_code}): {resp.text[:300]}")
+
+    link = None
+    try:
+        data = resp.json()
+        link = data.get("url") or data.get("link") or data.get("downloadUrl")
+    except ValueError:
+        pass
+
+    if not link:
+        text = resp.text.strip()
+        if text.startswith("http"):
+            link = text
+
+    if not link:
+        raise RuntimeError(f"Не удалось разобрать ответ {display_name}: {resp.text[:300]}")
+
+    return {"name": file_name, "size": os.path.getsize(file_path), "url": link}
+
+
+def upload_to_fuckingfast_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    return upload_to_wstyle_once(
+        "fuckingfast.net", "FuckingFast", FUCKINGFAST_TOKEN,
+        file_path, chat_id, status_msg_id, task_id, control, stage_start,
+    )
+
+
+def upload_to_buzzheavier_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    return upload_to_wstyle_once(
+        "buzzheavier.com", "BuzzHeavier", BUZZHEAVIER_TOKEN,
+        file_path, chat_id, status_msg_id, task_id, control, stage_start,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Загрузка на Gofile
+# ---------------------------------------------------------------------------
+
+def get_gofile_server():
+    resp = requests.get("https://api.gofile.io/servers", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    servers = (data.get("data") or {}).get("servers") or []
+    if not servers:
+        raise RuntimeError(f"Gofile не вернул список серверов: {data}")
+    return servers[0]["name"]
+
+
+def upload_to_gofile_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    server = get_gofile_server()
+    file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+
+    fh = open(file_path, "rb")
+    fields = {"file": (file_name, fh, "application/octet-stream")}
+    if GOFILE_API_TOKEN:
+        fields["token"] = GOFILE_API_TOKEN
+
+    encoder = MultipartEncoder(fields=fields)
+    state = {"last_edit": 0, "last_done": 0, "last_time": time.time(), "paused_shown": False}
+
+    def progress_callback(monitor):
+        if control.stopped.is_set():
+            raise TaskStopped()
+
+        if not control.running.is_set():
+            if not state["paused_shown"]:
+                text = render_progress("⬆️", "Загрузка на Gofile", monitor.bytes_read, monitor.len, 0,
+                                        time.time() - stage_start, paused=True)
+                edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
+                state["paused_shown"] = True
+            control.running.wait()
+            state["paused_shown"] = False
+            if control.stopped.is_set():
+                raise TaskStopped()
+
+        now = time.time()
+        if now - state["last_edit"] < 3:
+            return
+        done = monitor.bytes_read
+        dt = now - state["last_time"]
+        speed = (done - state["last_done"]) / dt if dt > 0 else 0
+        text = render_progress("⬆️", "Загрузка на Gofile", done, monitor.len, speed, now - stage_start)
+        edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
+        state["last_edit"] = now
+        state["last_done"] = done
+        state["last_time"] = now
+
+    monitor = MultipartEncoderMonitor(encoder, progress_callback)
+
+    try:
+        resp = requests.post(
+            f"https://{server}.gofile.io/contents/uploadfile", data=monitor,
+            headers={"Content-Type": monitor.content_type},
+            timeout=(30, None),
+        )
+    finally:
+        fh.close()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ошибка Gofile ({resp.status_code}): {resp.text[:300]}")
+
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"Ошибка Gofile: {data}")
+
+    d = data["data"]
+    return {"name": d.get("fileName", file_name), "size": file_size, "url": d["downloadPage"]}
+
+
+# ---------------------------------------------------------------------------
 # Общий диспетчер загрузки с ретраями
 # ---------------------------------------------------------------------------
 
 UPLOAD_FUNCS = {
     "vikingfile": upload_to_vikingfile_once,
     "pixeldrain": upload_to_pixeldrain_once,
+    "fuckingfast": upload_to_fuckingfast_once,
+    "buzzheavier": upload_to_buzzheavier_once,
+    "gofile": upload_to_gofile_once,
 }
 
 
@@ -702,7 +866,8 @@ def handle_message(message):
             chat_id,
             "👋 <b>Привет!</b>\n\n"
             "Пришли мне ссылку на файл — я скачаю его и предложу перезалить "
-            "на <b>VikingFile</b> или <b>Pixeldrain</b> на выбор.\n\n"
+            "на <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
+            "<b>BuzzHeavier</b> или <b>Gofile</b> на выбор.\n\n"
             "На этапе скачивания и загрузки под сообщением с прогрессом будут "
             "кнопки ⏸ <b>Пауза</b> и ⏹ <b>Стоп</b>.\n\n"
             "⚙️ <b>Команды</b>\n"
