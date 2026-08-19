@@ -788,10 +788,10 @@ def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, contro
         raise RuntimeError(t(lang, "host_http_error", host="Pixeldrain", code=resp.status_code, body=resp.text[:300]))
 
     data = resp.json()
-    if not data.get("success"):
+    file_id = data.get("id")
+    if not file_id:
         raise RuntimeError(f"Pixeldrain error: {data}")
 
-    file_id = data["id"]
     return {
         "name": file_name,
         "size": os.path.getsize(file_path),
@@ -844,20 +844,31 @@ def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, statu
 
     link = None
 
-    location = resp.headers.get("Location")
-    if location and location.startswith("http"):
-        link = location
+    # Основной формат ответа этой платформы: {"data": {"id": "..."}} -
+    # ссылку нужно собрать самим как https://<домен>/<id>. На всякий случай
+    # проверяем и другие возможные формы ответа (плоский id, явное поле url,
+    # заголовок Location, голый текст в теле).
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            file_id = (data.get("data") or {}).get("id") or data.get("id")
+            link = (
+                data.get("url") or data.get("link") or data.get("downloadUrl")
+                or data.get("downloadPage") or data.get("href")
+            )
+            if not link and file_id:
+                link = f"https://{domain}/{file_id}"
+    except ValueError:
+        pass
 
     if not link:
-        try:
-            data = resp.json()
-            if isinstance(data, dict):
-                link = (
-                    data.get("url") or data.get("link") or data.get("downloadUrl")
-                    or data.get("downloadPage") or data.get("href")
-                )
-        except ValueError:
-            pass
+        location = resp.headers.get("Location")
+        if location:
+            if location.startswith("http"):
+                link = location
+            else:
+                from urllib.parse import urljoin
+                link = urljoin(f"https://{domain}/", location)
 
     if not link:
         text = resp.text.strip()
