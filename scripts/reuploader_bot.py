@@ -32,7 +32,7 @@ import threading
 import subprocess
 import uuid
 from html import escape as html_escape
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
@@ -68,7 +68,7 @@ def _env_float(name, default):
 IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT_MINUTES", 10) * 60
 HARD_TIMEOUT = _env_int("HARD_TIMEOUT_SECONDS", 20400)
 PIXELDRAIN_MAX_SIZE_BYTES = int(_env_float("PIXELDRAIN_MAX_SIZE_GB", 20.0) * 1024 ** 3)
-SPEEDTEST_SIZE_MB = _env_int("SPEEDTEST_SIZE_MB", 20)
+SPEEDTEST_SIZE_MB = _env_int("SPEEDTEST_SIZE_MB", 100)
 
 DOWNLOAD_DIR = os.path.abspath("downloads")
 ARIA2_RPC_PORT = 6800
@@ -125,7 +125,8 @@ TEXTS = {
             "👋 <b>Привет! Я {bot_name}.</b>\n\n"
             "Пришли мне ссылку на файл — я скачаю его и предложу перезалить "
             "на <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
-            "<b>BuzzHeavier</b> или <b>Gofile</b> на выбор.\n\n"
+            "<b>BuzzHeavier</b> и/или <b>Gofile</b> — можно выбрать сразу несколько, "
+            "файл скачается один раз, а зальётся по очереди на все выбранные хостинги.\n\n"
             "На этапе скачивания и загрузки под сообщением с прогрессом будут "
             "кнопки ⏸ <b>Пауза</b> и ⏹ <b>Стоп</b>.\n\n"
             "⚙️ <b>Команды</b>\n"
@@ -141,11 +142,27 @@ TEXTS = {
         "busy": "⏳ Уже выполняется другая задача. Дождись её завершения или отправь /stop.",
         "ask_link": "📎 Пришли, пожалуйста, ссылку на файл (начинается с http:// или https://).",
         "size_line": "\n📦 Размер: ~{size}",
-        "link_received": "🔗 <b>Принял ссылку</b>\n<code>{url}</code>{size_line}\n\nКуда залить файл?",
+        "link_received": "🔗 <b>Принял ссылку</b>\n<code>{url}</code>{size_line}\n\nВыбери хостинги (можно несколько), затем нажми «Начать».",
         "stale_button": "Эта кнопка устарела",
         "pixeldrain_unavailable": "Pixeldrain недоступен: не задан PIXELDRAIN_API_KEY",
         "toolarge_alert": "⛔ Файл больше лимита {limit} для {host}. Выбери другой хостинг, например VikingFile.",
         "target_chosen": "Выбрано: {host}",
+        "select_all_button": "☑️ Выбрать все",
+        "clear_all_button": "◻️ Снять всё",
+        "start_button": "🚀 Начать ({n})",
+        "select_at_least_one": "Выбери хотя бы один хостинг",
+        "overview_title": "📦 <b>Мультизалив</b>\n{div}",
+        "in_progress_label": "загрузка...",
+        "pending_label": "в очереди",
+        "cancelled_label": "отменено",
+        "overview_row_ok": "✅ <b>{host}:</b> {url}",
+        "overview_row_fail": "❌ <b>{host}:</b> {err}",
+        "overview_row_pending": "{icon} <b>{host}:</b> {status}",
+        "multi_download_done": (
+            "✅ <b>Скачивание завершено</b>\n📄 <code>{name}</code>\n📦 {size}\n\n"
+            "⬆️ Начинаю заливать на {n} хостингов по очереди..."
+        ),
+        "multi_all_done": "🏁 Все загрузки завершены! Ссылки — в сообщении выше.",
         "task_finished_alert": "Задача уже завершена",
         "pause_alert": "⏸ Пауза",
         "resume_alert": "▶️ Продолжаю",
@@ -205,7 +222,8 @@ TEXTS = {
             "👋 <b>Hi! I'm {bot_name}.</b>\n\n"
             "Send me a link to a file — I'll download it and let you re-upload it "
             "to <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
-            "<b>BuzzHeavier</b> or <b>Gofile</b>, your choice.\n\n"
+            "<b>BuzzHeavier</b> and/or <b>Gofile</b> — you can pick several at once, "
+            "the file is downloaded once and then uploaded to each selected host in turn.\n\n"
             "During download and upload, the progress message will have "
             "⏸ <b>Pause</b> and ⏹ <b>Stop</b> buttons under it.\n\n"
             "⚙️ <b>Commands</b>\n"
@@ -221,11 +239,27 @@ TEXTS = {
         "busy": "⏳ Another task is already running. Wait for it to finish or send /stop.",
         "ask_link": "📎 Please send a link to a file (starting with http:// or https://).",
         "size_line": "\n📦 Size: ~{size}",
-        "link_received": "🔗 <b>Link received</b>\n<code>{url}</code>{size_line}\n\nWhere should I upload the file?",
+        "link_received": "🔗 <b>Link received</b>\n<code>{url}</code>{size_line}\n\nChoose hosting services (you can select several), then press Start.",
         "stale_button": "This button has expired",
         "pixeldrain_unavailable": "Pixeldrain unavailable: PIXELDRAIN_API_KEY is not set",
         "toolarge_alert": "⛔ File exceeds the {limit} limit for {host}. Pick another host, e.g. VikingFile.",
         "target_chosen": "Selected: {host}",
+        "select_all_button": "☑️ Select all",
+        "clear_all_button": "◻️ Clear all",
+        "start_button": "🚀 Start ({n})",
+        "select_at_least_one": "Select at least one host",
+        "overview_title": "📦 <b>Multi-reupload</b>\n{div}",
+        "in_progress_label": "uploading...",
+        "pending_label": "queued",
+        "cancelled_label": "cancelled",
+        "overview_row_ok": "✅ <b>{host}:</b> {url}",
+        "overview_row_fail": "❌ <b>{host}:</b> {err}",
+        "overview_row_pending": "{icon} <b>{host}:</b> {status}",
+        "multi_download_done": (
+            "✅ <b>Download complete</b>\n📄 <code>{name}</code>\n📦 {size}\n\n"
+            "⬆️ Uploading to {n} hosts one by one..."
+        ),
+        "multi_all_done": "🏁 All uploads are finished! Links are in the message above.",
         "task_finished_alert": "Task already finished",
         "pause_alert": "⏸ Paused",
         "resume_alert": "▶️ Resuming",
@@ -381,26 +415,51 @@ def build_language_keyboard():
     }
 
 
-def build_target_keyboard(token, file_size, lang):
-    row1 = [{"text": "🦁 VikingFile", "callback_data": f"target|vikingfile|{token}"}]
+HOST_ICONS = {
+    "vikingfile": "🦁",
+    "pixeldrain": "🟢",
+    "fuckingfast": "⚡",
+    "buzzheavier": "🐝",
+    "gofile": "📁",
+}
+
+
+def build_multiselect_keyboard(token, selected, file_size, lang):
+    def label(dest):
+        mark = "✅" if dest in selected else "⬜"
+        return f"{mark} {HOST_ICONS[dest]} {DESTINATIONS[dest]}"
 
     pixeldrain_too_large = file_size is not None and file_size > PIXELDRAIN_MAX_SIZE_BYTES
+
+    row1 = [{"text": label("vikingfile"), "callback_data": f"select|vikingfile|{token}"}]
     if pixeldrain_too_large:
         row1.append({
-            "text": f"🟢 Pixeldrain ⛔ >{human_size(PIXELDRAIN_MAX_SIZE_BYTES, lang)}",
+            "text": f"⛔ 🟢 Pixeldrain >{human_size(PIXELDRAIN_MAX_SIZE_BYTES, lang)}",
             "callback_data": f"toolarge|pixeldrain|{token}",
         })
     else:
-        row1.append({"text": "🟢 Pixeldrain", "callback_data": f"target|pixeldrain|{token}"})
-
-    row1.append({"text": "⚡ FuckingFast", "callback_data": f"target|fuckingfast|{token}"})
+        row1.append({"text": label("pixeldrain"), "callback_data": f"select|pixeldrain|{token}"})
+    row1.append({"text": label("fuckingfast"), "callback_data": f"select|fuckingfast|{token}"})
 
     row2 = [
-        {"text": "🐝 BuzzHeavier", "callback_data": f"target|buzzheavier|{token}"},
-        {"text": "📁 Gofile", "callback_data": f"target|gofile|{token}"},
+        {"text": label("buzzheavier"), "callback_data": f"select|buzzheavier|{token}"},
+        {"text": label("gofile"), "callback_data": f"select|gofile|{token}"},
     ]
 
-    return {"inline_keyboard": [row1, row2]}
+    selectable = [d for d in DESTINATIONS if not (d == "pixeldrain" and pixeldrain_too_large)]
+    all_selected = selected and all(d in selected for d in selectable)
+    row3 = [
+        {
+            "text": t(lang, "clear_all_button") if all_selected else t(lang, "select_all_button"),
+            "callback_data": f"selectall|{token}",
+        },
+        {
+            "text": t(lang, "start_button", n=len(selected)),
+            "callback_data": f"confirm|{token}",
+        },
+    ]
+
+    return {"inline_keyboard": [row1, row2, row3]}
 
 
 def build_progress_keyboard(task_id, control):
@@ -867,7 +926,6 @@ def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, statu
             if location.startswith("http"):
                 link = location
             else:
-                from urllib.parse import urljoin
                 link = urljoin(f"https://{domain}/", location)
 
     if not link:
@@ -1062,6 +1120,74 @@ def task_worker(chat_id, url, dest, status_msg_id, task_id, control):
         active_controls.pop(chat_id, None)
 
 
+def render_overview(lang, dest_list, results, in_progress=None, stopped=False):
+    lines = [t(lang, "overview_title", div=divider())]
+    for dest in dest_list:
+        host = DESTINATIONS[dest]
+        if dest in results:
+            status, val = results[dest]
+            if status == "ok":
+                lines.append(t(lang, "overview_row_ok", host=host, url=val["url"]))
+            else:
+                lines.append(t(lang, "overview_row_fail", host=host, err=val))
+        elif dest == in_progress:
+            lines.append(t(lang, "overview_row_pending", icon="🔄", host=host, status=t(lang, "in_progress_label")))
+        elif stopped:
+            lines.append(t(lang, "overview_row_pending", icon="⏹", host=host, status=t(lang, "cancelled_label")))
+        else:
+            lines.append(t(lang, "overview_row_pending", icon="⏳", host=host, status=t(lang, "pending_label")))
+    return "\n".join(lines)
+
+
+def multi_task_worker(chat_id, url, dest_list, overview_msg_id, progress_msg_id, task_id, control):
+    lang = control.lang
+    file_path = None
+    results = {}
+    try:
+        file_path = download_with_progress(url, chat_id, progress_msg_id, task_id, control)
+        size = os.path.getsize(file_path)
+
+        edit_message(
+            chat_id, progress_msg_id,
+            t(lang, "multi_download_done", name=html_escape(os.path.basename(file_path)),
+              size=human_size(size, lang), n=len(dest_list)),
+            reply_markup=build_progress_keyboard(task_id, control),
+        )
+
+        for dest in dest_list:
+            if control.stopped.is_set():
+                raise TaskStopped()
+
+            edit_message(chat_id, overview_msg_id, render_overview(lang, dest_list, results, in_progress=dest))
+
+            try:
+                result = upload_file(dest, file_path, chat_id, progress_msg_id, task_id, control)
+                results[dest] = ("ok", result)
+            except TaskStopped:
+                raise
+            except Exception as e:
+                results[dest] = ("error", html_escape(str(e))[:200])
+
+            edit_message(chat_id, overview_msg_id, render_overview(lang, dest_list, results, in_progress=None))
+
+        edit_message(chat_id, progress_msg_id, t(lang, "multi_all_done"), reply_markup={"inline_keyboard": []})
+
+    except TaskStopped:
+        edit_message(chat_id, progress_msg_id, t(lang, "stopped"), reply_markup={"inline_keyboard": []})
+        edit_message(chat_id, overview_msg_id, render_overview(lang, dest_list, results, in_progress=None, stopped=True))
+    except Exception as e:
+        edit_message(chat_id, progress_msg_id, t(lang, "error", err=html_escape(str(e))[:500]),
+                     reply_markup={"inline_keyboard": []})
+        edit_message(chat_id, overview_msg_id, render_overview(lang, dest_list, results, in_progress=None, stopped=True))
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        active_controls.pop(chat_id, None)
+
+
 # ---------------------------------------------------------------------------
 # Speedtest
 # ---------------------------------------------------------------------------
@@ -1211,12 +1337,16 @@ def handle_message(message):
     size_bytes = get_remote_file_size(url)
     size_line = t(lang, "size_line", size=human_size(size_bytes, lang)) if size_bytes else ""
 
+    selected = set()
     status = send_message(
         chat_id,
         t(lang, "link_received", url=html_escape(url), size_line=size_line),
-        reply_markup=build_target_keyboard(token, size_bytes, lang),
+        reply_markup=build_multiselect_keyboard(token, selected, size_bytes, lang),
     )
-    pending_selections[chat_id] = {"token": token, "url": url, "message_id": status["message_id"]}
+    pending_selections[chat_id] = {
+        "token": token, "url": url, "message_id": status["message_id"],
+        "selected": selected, "size": size_bytes, "size_line": size_line,
+    }
 
 
 def get_remote_file_size(url):
@@ -1271,7 +1401,7 @@ def handle_callback_query(cq):
         )
         return
 
-    if action == "target":
+    if action == "select":
         dest, token = parts[1], parts[2]
         pending = pending_selections.get(chat_id)
         if not pending or pending["token"] != token:
@@ -1282,16 +1412,80 @@ def handle_callback_query(cq):
             answer_callback(cq["id"], t(lang, "pixeldrain_unavailable"), show_alert=True)
             return
 
+        selected = pending["selected"]
+        if dest in selected:
+            selected.discard(dest)
+        else:
+            selected.add(dest)
+
+        answer_callback(cq["id"])
+        edit_message(
+            chat_id, message_id,
+            t(lang, "link_received", url=html_escape(pending["url"]), size_line=pending["size_line"]),
+            reply_markup=build_multiselect_keyboard(token, selected, pending["size"], lang),
+        )
+        return
+
+    if action == "selectall":
+        token = parts[1]
+        pending = pending_selections.get(chat_id)
+        if not pending or pending["token"] != token:
+            answer_callback(cq["id"], t(lang, "stale_button"), show_alert=True)
+            return
+
+        size_bytes = pending["size"]
+        pixeldrain_too_large = size_bytes is not None and size_bytes > PIXELDRAIN_MAX_SIZE_BYTES
+        selectable = [
+            d for d in DESTINATIONS
+            if not (d == "pixeldrain" and (pixeldrain_too_large or not PIXELDRAIN_API_KEY))
+        ]
+
+        selected = pending["selected"]
+        if selected and all(d in selected for d in selectable):
+            selected.clear()
+        else:
+            selected.clear()
+            selected.update(selectable)
+
+        answer_callback(cq["id"])
+        edit_message(
+            chat_id, message_id,
+            t(lang, "link_received", url=html_escape(pending["url"]), size_line=pending["size_line"]),
+            reply_markup=build_multiselect_keyboard(token, selected, size_bytes, lang),
+        )
+        return
+
+    if action == "confirm":
+        token = parts[1]
+        pending = pending_selections.get(chat_id)
+        if not pending or pending["token"] != token:
+            answer_callback(cq["id"], t(lang, "stale_button"), show_alert=True)
+            return
+
+        selected = pending["selected"]
+        if not selected:
+            answer_callback(cq["id"], t(lang, "select_at_least_one"), show_alert=True)
+            return
+
         del pending_selections[chat_id]
-        answer_callback(cq["id"], t(lang, "target_chosen", host=DESTINATIONS[dest]))
+        answer_callback(cq["id"])
+
+        dest_list = [d for d in DESTINATIONS if d in selected]
 
         task_id = uuid.uuid4().hex[:8]
         control = TaskControl(task_id, lang=lang)
         active_controls[chat_id] = control
 
+        overview_text = render_overview(lang, dest_list, {}, in_progress=None)
+        edit_message(chat_id, message_id, overview_text, reply_markup={"inline_keyboard": []})
+
+        progress_status = send_message(chat_id, t(lang, "target_start",
+                                                    host=", ".join(DESTINATIONS[d] for d in dest_list),
+                                                    url=html_escape(pending["url"])))
+
         thread = threading.Thread(
-            target=task_worker,
-            args=(chat_id, pending["url"], dest, message_id, task_id, control),
+            target=multi_task_worker,
+            args=(chat_id, pending["url"], dest_list, message_id, progress_status["message_id"], task_id, control),
             daemon=True,
         )
         thread.start()
