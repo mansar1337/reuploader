@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: "20"
+      speedtest_size_mb:
+        description: "Размер тестового файла для /speedtest (МБ)"
+        required: false
+        type: string
+        default: "100"
 
 # Если запустить workflow ещё раз, пока предыдущий бот ещё работает,
 # GitHub автоматически отменит старый запуск - это предотвращает конфликт
@@ -43,6 +48,7 @@ jobs:
       GOFILE_API_TOKEN: ${{ secrets.GOFILE_API_TOKEN }}
       IDLE_TIMEOUT_MINUTES: ${{ github.event.inputs.idle_timeout_minutes }}
       PIXELDRAIN_MAX_SIZE_GB: ${{ github.event.inputs.pixeldrain_max_size_gb }}
+      SPEEDTEST_SIZE_MB: ${{ github.event.inputs.speedtest_size_mb }}
       HARD_TIMEOUT_SECONDS: 20400   # ~340 минут, чуть меньше timeout-minutes выше
 
     steps:
