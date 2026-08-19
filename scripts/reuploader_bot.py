@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для перезалива файлов на VikingFile или Pixeldrain.
+xendr4x reuploader - Telegram-бот для перезалива файлов на файлообменники.
+
+Поддерживаемые хостинги: VikingFile, Pixeldrain, FuckingFast, BuzzHeavier, Gofile.
 
 Логика:
   1. Бот поднимает aria2c в режиме RPC (для получения реального прогресса скачивания).
   2. Бот слушает Telegram через long polling (getUpdates), включая нажатия кнопок.
   3. Пользователь присылает боту ссылку на файл.
-  4. Бот предлагает выбрать хостинг для перезалива (VikingFile / Pixeldrain) кнопками.
+  4. Бот предлагает выбрать хостинг для перезалива кнопками.
   5. Бот скачивает файл через aria2c, показывая прогресс с кнопками "Пауза" / "Стоп".
   6. Бот заливает файл на выбранный хостинг, тоже с прогрессом и кнопками управления.
   7. Бот присылает финальную ссылку на файл.
 
-Пауза на скачивании — настоящая (aria2c реально приостанавливает соединение).
-Пауза на загрузке — "мягкая": поток чтения файла блокируется, HTTP-соединение
-при этом может провиснуть; если хостинг оборвёт его при долгой паузе, бот
-предложит повторить загрузку.
+Дополнительно:
+  - /speedtest - замеряет скорость аплоада на каждый поддерживаемый хостинг.
+  - /language - переключение интерфейса между русским и английским.
+  - /stop - останавливает текущую задачу; /shutdown - останавливает бота целиком.
 
-Если новых сообщений нет дольше IDLE_TIMEOUT минут — бот завершает работу.
-Команда /stop в чате завершает работу бота целиком (не путать с кнопкой "Стоп",
-которая останавливает только текущую задачу).
+Если новых сообщений нет дольше IDLE_TIMEOUT минут - бот завершает работу.
 """
 
 import os
@@ -42,15 +42,18 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncod
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-VIKINGFILE_USER_HASH = os.environ.get("VIKINGFILE_USER_HASH", "")   # пусто = анонимная загрузка
-PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")       # нужен только если выбран Pixeldrain
-FUCKINGFAST_TOKEN = os.environ.get("FUCKINGFAST_TOKEN", "")         # опционально, для привязки к аккаунту
-BUZZHEAVIER_TOKEN = os.environ.get("BUZZHEAVIER_TOKEN", "")         # опционально, для привязки к аккаунту
-GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "")           # опционально, иначе гостевая загрузка
+BOT_DISPLAY_NAME = "xendr4x reuploader"
+
+VIKINGFILE_USER_HASH = os.environ.get("VIKINGFILE_USER_HASH", "")
+PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
+FUCKINGFAST_TOKEN = os.environ.get("FUCKINGFAST_TOKEN", "")
+BUZZHEAVIER_TOKEN = os.environ.get("BUZZHEAVIER_TOKEN", "")
+GOFILE_API_TOKEN = os.environ.get("GOFILE_API_TOKEN", "")
 
 ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
+
 
 def _env_int(name, default):
     val = os.environ.get(name, "").strip()
@@ -65,6 +68,7 @@ def _env_float(name, default):
 IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT_MINUTES", 10) * 60
 HARD_TIMEOUT = _env_int("HARD_TIMEOUT_SECONDS", 20400)
 PIXELDRAIN_MAX_SIZE_BYTES = int(_env_float("PIXELDRAIN_MAX_SIZE_GB", 20.0) * 1024 ** 3)
+SPEEDTEST_SIZE_MB = _env_int("SPEEDTEST_SIZE_MB", 20)
 
 DOWNLOAD_DIR = os.path.abspath("downloads")
 ARIA2_RPC_PORT = 6800
@@ -90,23 +94,220 @@ start_time = time.time()
 last_activity_time = time.time()
 should_stop_bot = threading.Event()
 
-# Ожидающие выбора хостинга: chat_id -> {"token", "url", "message_id"}
-pending_selections = {}
-# Активные задачи: chat_id -> TaskControl
-active_controls = {}
+pending_selections = {}   # chat_id -> {"token", "url", "message_id"}
+active_controls = {}      # chat_id -> TaskControl
+user_lang = {}            # chat_id -> "ru" / "en"
+
+DEFAULT_LANG = "ru"
 
 
 class TaskStopped(Exception):
-    """Пользователь остановил задачу кнопкой Стоп."""
+    """Пользователь остановил задачу кнопкой Стоп / командой /stop."""
 
 
 class TaskControl:
-    def __init__(self, task_id):
+    def __init__(self, task_id, lang=DEFAULT_LANG):
         self.task_id = task_id
+        self.lang = lang
         self.stopped = threading.Event()
         self.running = threading.Event()
-        self.running.set()   # изначально не на паузе
-        self.gid = None       # gid текущей задачи aria2 (на этапе скачивания)
+        self.running.set()
+        self.gid = None
+
+
+# ---------------------------------------------------------------------------
+# Локализация
+# ---------------------------------------------------------------------------
+
+TEXTS = {
+    "ru": {
+        "start": (
+            "👋 <b>Привет! Я {bot_name}.</b>\n\n"
+            "Пришли мне ссылку на файл — я скачаю его и предложу перезалить "
+            "на <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
+            "<b>BuzzHeavier</b> или <b>Gofile</b> на выбор.\n\n"
+            "На этапе скачивания и загрузки под сообщением с прогрессом будут "
+            "кнопки ⏸ <b>Пауза</b> и ⏹ <b>Стоп</b>.\n\n"
+            "⚙️ <b>Команды</b>\n"
+            "/speedtest — замерить скорость загрузки на каждый хостинг\n"
+            "/language — сменить язык интерфейса\n"
+            "/stop — остановить текущую задачу (аналог кнопки ⏹ Стоп)\n"
+            "/shutdown — полностью завершить работу бота"
+        ),
+        "no_access": "⛔ У вас нет доступа к этому боту.",
+        "stop_task": "⏹ Останавливаю текущую задачу...",
+        "stop_no_task": "ℹ️ Сейчас нет активной задачи. Чтобы полностью завершить бота, используй /shutdown.",
+        "shutdown": "🛑 Останавливаю бота полностью...",
+        "busy": "⏳ Уже выполняется другая задача. Дождись её завершения или отправь /stop.",
+        "ask_link": "📎 Пришли, пожалуйста, ссылку на файл (начинается с http:// или https://).",
+        "size_line": "\n📦 Размер: ~{size}",
+        "link_received": "🔗 <b>Принял ссылку</b>\n<code>{url}</code>{size_line}\n\nКуда залить файл?",
+        "stale_button": "Эта кнопка устарела",
+        "pixeldrain_unavailable": "Pixeldrain недоступен: не задан PIXELDRAIN_API_KEY",
+        "toolarge_alert": "⛔ Файл больше лимита {limit} для {host}. Выбери другой хостинг, например VikingFile.",
+        "target_chosen": "Выбрано: {host}",
+        "task_finished_alert": "Задача уже завершена",
+        "pause_alert": "⏸ Пауза",
+        "resume_alert": "▶️ Продолжаю",
+        "stopping_alert": "⏹ Останавливаю задачу...",
+        "target_start": "🎯 <b>Хостинг:</b> {host}\n🔗 <code>{url}</code>\n\n⏳ Начинаю скачивание...",
+        "download_done": (
+            "✅ <b>Скачивание завершено</b>\n"
+            "📄 <code>{name}</code>\n📦 {size}\n\n"
+            "⬆️ Начинаю загрузку на {host}..."
+        ),
+        "done": (
+            "🎉 <b>Готово!</b>\n{div}\n"
+            "📄 <b>Файл:</b> <code>{name}</code>\n"
+            "📦 <b>Размер:</b> {size}\n"
+            "🌐 <b>Хостинг:</b> {host}\n"
+            "🕐 <b>Затрачено времени:</b> {time}\n{div}\n"
+            "🔗 <b>Ссылка:</b> {url}"
+        ),
+        "stopped": "⏹ <b>Остановлено пользователем</b>",
+        "error": "❌ <b>Ошибка</b>\n<code>{err}</code>",
+        "retry": (
+            "⚠️ Сбой сети при загрузке (попытка {attempt}/{total}), "
+            "пробую снова через {wait}с...\n<code>{err}</code>"
+        ),
+        "upload_failed_final": "Не удалось загрузить после {total} попыток: {err}{hint}",
+        "pixeldrain_hint": (
+            "\n\n💡 Похоже, Pixeldrain систематически рвёт соединение (SSL EOF) - "
+            "это часто означает, что сервис ограничивает загрузку с IP-адресов "
+            "дата-центров/CI (какие использует GitHub Actions). Попробуй прислать "
+            "ссылку заново и выбрать <b>VikingFile</b> - он обычно стабильнее в такой среде."
+        ),
+        "pixeldrain_key_missing": "Секрет PIXELDRAIN_API_KEY не задан в репозитории.",
+        "host_http_error": "Ошибка {host} ({code}): {body}",
+        "host_link_missing": (
+            "Ошибка {host}: сервер ответил {code}, но ссылку в ответе найти не удалось "
+            "(нет ни Location, ни JSON с url, ни текстовой ссылки в теле). Тело ответа: {body}"
+        ),
+        "downloading_title": "Скачивание файла",
+        "uploading_title": "Загрузка на {host}",
+        "paused_title": "На паузе",
+        "elapsed_label": "Прошло",
+        "pause_button": "⏸ Пауза",
+        "resume_button": "▶️ Продолжить",
+        "stop_button": "⏹ Стоп",
+        "language_prompt": "🌐 Выбери язык интерфейса:",
+        "language_set": "✅ Язык переключён на русский.",
+        "speedtest_busy": "⏳ Уже выполняется другая задача (в т.ч. другой speedtest). Дождись её завершения или отправь /stop.",
+        "speedtest_start": "🚀 <b>Speedtest</b>\nЗамеряю скорость загрузки на {n} хостингов (тестовый файл {size})...",
+        "speedtest_progress": "🚀 Тестирую {host} ({i}/{n})...",
+        "speedtest_title": "🚀 <b>Результаты speedtest</b>\nТестовый файл: {size}\n{div}",
+        "speedtest_row_ok": "{medal} <b>{host}</b>: {speed}/с ({time})",
+        "speedtest_row_fail": "⚠️ <b>{host}</b>: {err}",
+        "speedtest_skip_no_key": "нет API-ключа, пропущено",
+    },
+    "en": {
+        "start": (
+            "👋 <b>Hi! I'm {bot_name}.</b>\n\n"
+            "Send me a link to a file — I'll download it and let you re-upload it "
+            "to <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
+            "<b>BuzzHeavier</b> or <b>Gofile</b>, your choice.\n\n"
+            "During download and upload, the progress message will have "
+            "⏸ <b>Pause</b> and ⏹ <b>Stop</b> buttons under it.\n\n"
+            "⚙️ <b>Commands</b>\n"
+            "/speedtest — measure upload speed to each hosting service\n"
+            "/language — switch interface language\n"
+            "/stop — stop the current task (same as the ⏹ Stop button)\n"
+            "/shutdown — fully shut down the bot"
+        ),
+        "no_access": "⛔ You don't have access to this bot.",
+        "stop_task": "⏹ Stopping the current task...",
+        "stop_no_task": "ℹ️ No active task right now. To fully shut down the bot, use /shutdown.",
+        "shutdown": "🛑 Shutting down the bot completely...",
+        "busy": "⏳ Another task is already running. Wait for it to finish or send /stop.",
+        "ask_link": "📎 Please send a link to a file (starting with http:// or https://).",
+        "size_line": "\n📦 Size: ~{size}",
+        "link_received": "🔗 <b>Link received</b>\n<code>{url}</code>{size_line}\n\nWhere should I upload the file?",
+        "stale_button": "This button has expired",
+        "pixeldrain_unavailable": "Pixeldrain unavailable: PIXELDRAIN_API_KEY is not set",
+        "toolarge_alert": "⛔ File exceeds the {limit} limit for {host}. Pick another host, e.g. VikingFile.",
+        "target_chosen": "Selected: {host}",
+        "task_finished_alert": "Task already finished",
+        "pause_alert": "⏸ Paused",
+        "resume_alert": "▶️ Resuming",
+        "stopping_alert": "⏹ Stopping task...",
+        "target_start": "🎯 <b>Host:</b> {host}\n🔗 <code>{url}</code>\n\n⏳ Starting download...",
+        "download_done": (
+            "✅ <b>Download complete</b>\n"
+            "📄 <code>{name}</code>\n📦 {size}\n\n"
+            "⬆️ Starting upload to {host}..."
+        ),
+        "done": (
+            "🎉 <b>Done!</b>\n{div}\n"
+            "📄 <b>File:</b> <code>{name}</code>\n"
+            "📦 <b>Size:</b> {size}\n"
+            "🌐 <b>Host:</b> {host}\n"
+            "🕐 <b>Time spent:</b> {time}\n{div}\n"
+            "🔗 <b>Link:</b> {url}"
+        ),
+        "stopped": "⏹ <b>Stopped by user</b>",
+        "error": "❌ <b>Error</b>\n<code>{err}</code>",
+        "retry": (
+            "⚠️ Network error while uploading (attempt {attempt}/{total}), "
+            "retrying in {wait}s...\n<code>{err}</code>"
+        ),
+        "upload_failed_final": "Upload failed after {total} attempts: {err}{hint}",
+        "pixeldrain_hint": (
+            "\n\n💡 Pixeldrain seems to be consistently dropping the connection (SSL EOF) - "
+            "this usually means the service is throttling/blocking uploads from datacenter/CI "
+            "IP ranges (which is what GitHub Actions runners use). Try sending the link again "
+            "and choosing <b>VikingFile</b> instead - it tends to be more reliable in this environment."
+        ),
+        "pixeldrain_key_missing": "The PIXELDRAIN_API_KEY secret is not set in the repository.",
+        "host_http_error": "{host} error ({code}): {body}",
+        "host_link_missing": (
+            "{host} error: server responded {code}, but no link could be found in the response "
+            "(no Location header, no JSON url field, no plain-text link body). Response body: {body}"
+        ),
+        "downloading_title": "Downloading file",
+        "uploading_title": "Uploading to {host}",
+        "paused_title": "Paused",
+        "elapsed_label": "Elapsed",
+        "pause_button": "⏸ Pause",
+        "resume_button": "▶️ Resume",
+        "stop_button": "⏹ Stop",
+        "language_prompt": "🌐 Choose interface language:",
+        "language_set": "✅ Language switched to English.",
+        "speedtest_busy": "⏳ Another task (including another speedtest) is already running. Wait for it or send /stop.",
+        "speedtest_start": "🚀 <b>Speedtest</b>\nMeasuring upload speed to {n} hosts (test file {size})...",
+        "speedtest_progress": "🚀 Testing {host} ({i}/{n})...",
+        "speedtest_title": "🚀 <b>Speedtest results</b>\nTest file: {size}\n{div}",
+        "speedtest_row_ok": "{medal} <b>{host}</b>: {speed}/s ({time})",
+        "speedtest_row_fail": "⚠️ <b>{host}</b>: {err}",
+        "speedtest_skip_no_key": "no API key, skipped",
+    },
+}
+
+SIZE_UNITS = {
+    "ru": ["Б", "КБ", "МБ", "ГБ", "ТБ", "ПБ"],
+    "en": ["B", "KB", "MB", "GB", "TB", "PB"],
+}
+
+
+def t(lang, key, **kwargs):
+    lang = lang if lang in TEXTS else DEFAULT_LANG
+    template = TEXTS.get(lang, {}).get(key)
+    if template is None:
+        template = TEXTS[DEFAULT_LANG].get(key, key)
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
+
+
+def get_lang(chat_id, tg_user=None):
+    if chat_id in user_lang:
+        return user_lang[chat_id]
+    lang = DEFAULT_LANG
+    if tg_user:
+        code = (tg_user.get("language_code") or "").lower()
+        lang = "ru" if code.startswith("ru") else "en"
+    user_lang[chat_id] = lang
+    return lang
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +348,7 @@ def answer_callback(callback_id, text=None, show_alert=False):
     try:
         tg_call("answerCallbackQuery", callback_query_id=callback_id, text=text or "", show_alert=show_alert)
     except RuntimeError:
-        pass  # callback мог устареть - не критично
+        pass
 
 
 def get_updates(offset):
@@ -171,38 +372,22 @@ def get_updates(offset):
 # Клавиатуры
 # ---------------------------------------------------------------------------
 
-def get_remote_file_size(url):
-    """Пытается узнать размер файла по заголовкам, не скачивая его. Возвращает
-    размер в байтах или None, если узнать не удалось (не критично)."""
-    try:
-        resp = requests.head(url, allow_redirects=True, timeout=10)
-        size = resp.headers.get("Content-Length")
-        if resp.status_code < 400 and size:
-            return int(size)
-    except requests.RequestException:
-        pass
-
-    try:
-        with requests.get(url, stream=True, timeout=10) as resp:
-            size = resp.headers.get("Content-Length")
-            if resp.status_code < 400 and size:
-                return int(size)
-    except requests.RequestException:
-        pass
-
-    return None
+def build_language_keyboard():
+    return {
+        "inline_keyboard": [[
+            {"text": "🇷🇺 Русский", "callback_data": "lang|ru"},
+            {"text": "🇬🇧 English", "callback_data": "lang|en"},
+        ]]
+    }
 
 
-def build_target_keyboard(token, file_size=None):
+def build_target_keyboard(token, file_size, lang):
     row1 = [{"text": "🦁 VikingFile", "callback_data": f"target|vikingfile|{token}"}]
 
-    pixeldrain_too_large = (
-        file_size is not None
-        and file_size > PIXELDRAIN_MAX_SIZE_BYTES
-    )
+    pixeldrain_too_large = file_size is not None and file_size > PIXELDRAIN_MAX_SIZE_BYTES
     if pixeldrain_too_large:
         row1.append({
-            "text": f"🟢 Pixeldrain ⛔ >{human_size(PIXELDRAIN_MAX_SIZE_BYTES)}",
+            "text": f"🟢 Pixeldrain ⛔ >{human_size(PIXELDRAIN_MAX_SIZE_BYTES, lang)}",
             "callback_data": f"toolarge|pixeldrain|{token}",
         })
     else:
@@ -219,11 +404,12 @@ def build_target_keyboard(token, file_size=None):
 
 
 def build_progress_keyboard(task_id, control):
-    toggle_label = "⏸ Пауза" if control.running.is_set() else "▶️ Продолжить"
+    lang = control.lang
+    toggle_label = t(lang, "pause_button") if control.running.is_set() else t(lang, "resume_button")
     return {
         "inline_keyboard": [[
             {"text": toggle_label, "callback_data": f"toggle|{task_id}"},
-            {"text": "⏹ Стоп", "callback_data": f"stop|{task_id}"},
+            {"text": t(lang, "stop_button"), "callback_data": f"stop|{task_id}"},
         ]]
     }
 
@@ -232,19 +418,26 @@ def build_progress_keyboard(task_id, control):
 # Визуал: прогресс-бары, форматирование
 # ---------------------------------------------------------------------------
 
-def human_size(n):
+def human_size(n, lang=DEFAULT_LANG):
+    units = SIZE_UNITS.get(lang, SIZE_UNITS[DEFAULT_LANG])
     n = float(n)
-    for unit in ["Б", "КБ", "МБ", "ГБ", "ТБ"]:
+    for unit in units:
         if n < 1024:
             return f"{n:.1f} {unit}"
         n /= 1024
-    return f"{n:.1f} ПБ"
+    return f"{n:.1f} {units[-1]}"
 
 
-def human_time(seconds):
+def human_time(seconds, lang=DEFAULT_LANG):
     seconds = max(0, int(seconds))
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
+    if lang == "en":
+        if h:
+            return f"{h}h {m:02d}m {s:02d}s"
+        if m:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
     if h:
         return f"{h}ч {m:02d}м {s:02d}с"
     if m:
@@ -265,7 +458,7 @@ def progress_bar(fraction, width=18):
     return bar
 
 
-def render_progress(icon, title, done, total, speed_bps, elapsed, paused=False):
+def render_progress(icon, title, done, total, speed_bps, elapsed, lang, paused=False):
     if total > 0:
         frac = done / total
         pct = frac * 100
@@ -276,18 +469,20 @@ def render_progress(icon, title, done, total, speed_bps, elapsed, paused=False):
         eta = None
 
     bar = progress_bar(frac)
-    speed_str = f"{human_size(speed_bps)}/с" if speed_bps else "—"
-    eta_str = human_time(eta) if eta is not None else "—"
+    speed_str = f"{human_size(speed_bps, lang)}/с" if lang == "ru" and speed_bps else (
+        f"{human_size(speed_bps, lang)}/s" if speed_bps else "—"
+    )
+    eta_str = human_time(eta, lang) if eta is not None else "—"
 
-    status_line = "⏸ <b>На паузе</b>" if paused else f"{icon} <b>{title}</b>"
+    status_line = f"⏸ <b>{t(lang, 'paused_title')}</b>" if paused else f"{icon} <b>{title}</b>"
 
     lines = [
         status_line,
         "",
         f"<code>[{bar}] {pct:5.1f}%</code>",
-        f"📦 {human_size(done)} / {human_size(total) if total else '?'}",
+        f"📦 {human_size(done, lang)} / {human_size(total, lang) if total else '?'}",
         f"⚡ {speed_str}   ⏳ ETA: {eta_str}",
-        f"🕐 Прошло: {human_time(elapsed)}",
+        f"🕐 {t(lang, 'elapsed_label')}: {human_time(elapsed, lang)}",
     ]
     return "\n".join(lines)
 
@@ -333,7 +528,7 @@ def start_aria2c():
             return
         except Exception:
             time.sleep(0.2)
-    raise RuntimeError("Не удалось поднять aria2c RPC")
+    raise RuntimeError("Failed to bring up aria2c RPC")
 
 
 def stop_aria2c():
@@ -361,9 +556,9 @@ def aria2_rpc(method, params=None):
 
 
 def download_with_progress(url, chat_id, status_msg_id, task_id, control):
-    """Скачивает файл через aria2c с поддержкой паузы/стопа. Возвращает путь к файлу."""
     gid = aria2_rpc("aria2.addUri", [[url]])
     control.gid = gid
+    lang = control.lang
 
     last_edit_text = None
     last_edit_time = 0
@@ -389,7 +584,8 @@ def download_with_progress(url, chat_id, status_msg_id, task_id, control):
                     status = aria2_rpc("aria2.tellStatus", [gid, ["totalLength", "completedLength"]])
                     total = int(status.get("totalLength") or 0)
                     done = int(status.get("completedLength") or 0)
-                    text = render_progress("⬇️", "Скачивание файла", done, total, 0, time.time() - stage_start, paused=True)
+                    text = render_progress("⬇️", t(lang, "downloading_title"), done, total, 0,
+                                            time.time() - stage_start, lang, paused=True)
                     edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
                 control.running.wait(timeout=1)
                 continue
@@ -411,11 +607,12 @@ def download_with_progress(url, chat_id, status_msg_id, task_id, control):
             speed = int(status.get("downloadSpeed") or 0)
 
             if state == "error":
-                raise RuntimeError(f"Ошибка aria2c: {status.get('errorMessage', 'неизвестная ошибка')}")
+                raise RuntimeError(f"aria2c error: {status.get('errorMessage', 'unknown error')}")
 
             now = time.time()
             if now - last_edit_time >= 3:
-                text = render_progress("⬇️", "Скачивание файла", done, total, speed, now - stage_start)
+                text = render_progress("⬇️", t(lang, "downloading_title"), done, total, speed,
+                                        now - stage_start, lang)
                 if text != last_edit_text:
                     edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
                     last_edit_text = text
@@ -425,7 +622,7 @@ def download_with_progress(url, chat_id, status_msg_id, task_id, control):
                 return status["files"][0]["path"]
 
             if state not in ("active", "waiting", "paused"):
-                raise RuntimeError(f"Неожиданный статус aria2c: {state}")
+                raise RuntimeError(f"Unexpected aria2c status: {state}")
 
             time.sleep(1)
     finally:
@@ -433,87 +630,10 @@ def download_with_progress(url, chat_id, status_msg_id, task_id, control):
 
 
 # ---------------------------------------------------------------------------
-# Загрузка на VikingFile
-# ---------------------------------------------------------------------------
-
-def get_vikingfile_upload_server():
-    resp = requests.get("https://vikingfile.com/api/get-server", timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    server = data.get("server")
-    if not server:
-        raise RuntimeError(f"VikingFile не вернул адрес сервера загрузки: {data}")
-    return server
-
-
-def upload_to_vikingfile_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
-    server_url = get_vikingfile_upload_server()
-    file_name = os.path.basename(file_path)
-    file_size = os.path.getsize(file_path)
-
-    fh = open(file_path, "rb")
-    encoder = MultipartEncoder(fields={
-        "file": (file_name, fh, "application/octet-stream"),
-        "user": VIKINGFILE_USER_HASH,
-    })
-
-    state = {"last_edit": 0, "last_done": 0, "last_time": time.time(), "paused_shown": False}
-
-    def progress_callback(monitor):
-        if control.stopped.is_set():
-            raise TaskStopped()
-
-        if not control.running.is_set():
-            if not state["paused_shown"]:
-                text = render_progress("⬆️", "Загрузка на VikingFile", monitor.bytes_read, monitor.len, 0,
-                                        time.time() - stage_start, paused=True)
-                edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
-                state["paused_shown"] = True
-            control.running.wait()
-            state["paused_shown"] = False
-            if control.stopped.is_set():
-                raise TaskStopped()
-
-        now = time.time()
-        if now - state["last_edit"] < 3:
-            return
-        done = monitor.bytes_read
-        dt = now - state["last_time"]
-        speed = (done - state["last_done"]) / dt if dt > 0 else 0
-        text = render_progress("⬆️", "Загрузка на VikingFile", done, monitor.len, speed, now - stage_start)
-        edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
-        state["last_edit"] = now
-        state["last_done"] = done
-        state["last_time"] = now
-
-    monitor = MultipartEncoderMonitor(encoder, progress_callback)
-
-    try:
-        resp = requests.post(
-            server_url, data=monitor,
-            headers={"Content-Type": monitor.content_type},
-            timeout=(30, None),
-        )
-    finally:
-        fh.close()
-
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Ошибка VikingFile ({resp.status_code}): {resp.text[:300]}")
-
-    data = resp.json()
-    if not data.get("url"):
-        raise RuntimeError(f"Ошибка VikingFile: {data}")
-
-    return {"name": data.get("name", file_name), "size": data.get("size", file_size), "url": data["url"]}
-
-
-# ---------------------------------------------------------------------------
-# Загрузка на Pixeldrain
+# Общая обёртка для чтения файла с поддержкой паузы/стопа (используется PUT-загрузками)
 # ---------------------------------------------------------------------------
 
 class ControlledFileReader:
-    """Файл-обёртка с поддержкой паузы/стопа и подсчётом прочитанных байт (для PUT-загрузки)."""
-
     def __init__(self, path, control, on_progress):
         self._f = open(path, "rb")
         self.size = os.fstat(self._f.fileno()).st_size
@@ -547,9 +667,92 @@ class ControlledFileReader:
         self._f.close()
 
 
+# ---------------------------------------------------------------------------
+# Загрузка на VikingFile
+# ---------------------------------------------------------------------------
+
+def get_vikingfile_upload_server():
+    resp = requests.get("https://vikingfile.com/api/get-server", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    server = data.get("server")
+    if not server:
+        raise RuntimeError(f"VikingFile did not return an upload server: {data}")
+    return server
+
+
+def upload_to_vikingfile_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    lang = control.lang
+    server_url = get_vikingfile_upload_server()
+    file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+
+    fh = open(file_path, "rb")
+    encoder = MultipartEncoder(fields={
+        "file": (file_name, fh, "application/octet-stream"),
+        "user": VIKINGFILE_USER_HASH,
+    })
+
+    state = {"last_edit": 0, "last_done": 0, "last_time": time.time(), "paused_shown": False}
+
+    def progress_callback(monitor):
+        if control.stopped.is_set():
+            raise TaskStopped()
+
+        if not control.running.is_set():
+            if not state["paused_shown"]:
+                text = render_progress("⬆️", t(lang, "uploading_title", host="VikingFile"),
+                                        monitor.bytes_read, monitor.len, 0,
+                                        time.time() - stage_start, lang, paused=True)
+                edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
+                state["paused_shown"] = True
+            control.running.wait()
+            state["paused_shown"] = False
+            if control.stopped.is_set():
+                raise TaskStopped()
+
+        now = time.time()
+        if now - state["last_edit"] < 3:
+            return
+        done = monitor.bytes_read
+        dt = now - state["last_time"]
+        speed = (done - state["last_done"]) / dt if dt > 0 else 0
+        text = render_progress("⬆️", t(lang, "uploading_title", host="VikingFile"), done, monitor.len, speed,
+                                now - stage_start, lang)
+        edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
+        state["last_edit"] = now
+        state["last_done"] = done
+        state["last_time"] = now
+
+    monitor = MultipartEncoderMonitor(encoder, progress_callback)
+
+    try:
+        resp = requests.post(
+            server_url, data=monitor,
+            headers={"Content-Type": monitor.content_type},
+            timeout=(30, None),
+        )
+    finally:
+        fh.close()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(t(lang, "host_http_error", host="VikingFile", code=resp.status_code, body=resp.text[:300]))
+
+    data = resp.json()
+    if not data.get("url"):
+        raise RuntimeError(f"VikingFile error: {data}")
+
+    return {"name": data.get("name", file_name), "size": data.get("size", file_size), "url": data["url"]}
+
+
+# ---------------------------------------------------------------------------
+# Загрузка на Pixeldrain
+# ---------------------------------------------------------------------------
+
 def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    lang = control.lang
     if not PIXELDRAIN_API_KEY:
-        raise RuntimeError("Секрет PIXELDRAIN_API_KEY не задан в репозитории.")
+        raise RuntimeError(t(lang, "pixeldrain_key_missing"))
 
     file_name = os.path.basename(file_path)
     encoded_name = quote(file_name)
@@ -562,7 +765,8 @@ def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, contro
             return
         dt = now - state["last_time"]
         speed = (done - state["last_done"]) / dt if (dt > 0 and not paused) else 0
-        text = render_progress("⬆️", "Загрузка на Pixeldrain", done, total, speed, now - stage_start, paused=paused)
+        text = render_progress("⬆️", t(lang, "uploading_title", host="Pixeldrain"), done, total, speed,
+                                now - stage_start, lang, paused=paused)
         edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
         state["last_edit"] = now
         state["last_done"] = done
@@ -581,11 +785,11 @@ def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, contro
         reader.close()
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"Ошибка Pixeldrain ({resp.status_code}): {resp.text[:300]}")
+        raise RuntimeError(t(lang, "host_http_error", host="Pixeldrain", code=resp.status_code, body=resp.text[:300]))
 
     data = resp.json()
     if not data.get("success"):
-        raise RuntimeError(f"Ошибка Pixeldrain: {data}")
+        raise RuntimeError(f"Pixeldrain error: {data}")
 
     file_id = data["id"]
     return {
@@ -598,13 +802,15 @@ def upload_to_pixeldrain_once(file_path, chat_id, status_msg_id, task_id, contro
 # ---------------------------------------------------------------------------
 # Загрузка на FuckingFast / BuzzHeavier
 # ---------------------------------------------------------------------------
-# Оба сервиса работают на одинаковой платформе: анонимная загрузка - это
-# простой PUT с телом файла на поддомен w.<домен>/{имя_файла}. Ответ сервера
-# в некоторых случаях приходит как JSON, а в некоторых - как обычный текст
-# со ссылкой (именно поэтому в официальных примерах его просто пишут в stdout
-# через `| cat`), так что разбираем оба варианта.
+# Обе платформы используют одинаковый API: анонимный PUT с телом файла на
+# поддомен w.<домен>/{имя_файла}. Ссылка на результат может прийти как:
+#  - заголовок Location (частый случай для HTTP 201 Created);
+#  - JSON с полем url/link/...;
+#  - обычный текст со ссылкой в теле ответа (см. официальные curl-примеры,
+#    где тело просто печатают в stdout через `| cat`).
 
 def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    lang = control.lang
     file_name = os.path.basename(file_path)
     upload_url = f"https://w.{domain}/{quote(file_name)}"
 
@@ -616,8 +822,8 @@ def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, statu
             return
         dt = now - state["last_time"]
         speed = (done - state["last_done"]) / dt if (dt > 0 and not paused) else 0
-        text = render_progress("⬆️", f"Загрузка на {display_name}", done, total, speed,
-                                now - stage_start, paused=paused)
+        text = render_progress("⬆️", t(lang, "uploading_title", host=display_name), done, total, speed,
+                                now - stage_start, lang, paused=paused)
         edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
         state["last_edit"] = now
         state["last_done"] = done
@@ -634,14 +840,24 @@ def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, statu
         reader.close()
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"Ошибка {display_name} ({resp.status_code}): {resp.text[:300]}")
+        raise RuntimeError(t(lang, "host_http_error", host=display_name, code=resp.status_code, body=resp.text[:300]))
 
     link = None
-    try:
-        data = resp.json()
-        link = data.get("url") or data.get("link") or data.get("downloadUrl")
-    except ValueError:
-        pass
+
+    location = resp.headers.get("Location")
+    if location and location.startswith("http"):
+        link = location
+
+    if not link:
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                link = (
+                    data.get("url") or data.get("link") or data.get("downloadUrl")
+                    or data.get("downloadPage") or data.get("href")
+                )
+        except ValueError:
+            pass
 
     if not link:
         text = resp.text.strip()
@@ -649,7 +865,8 @@ def upload_to_wstyle_once(domain, display_name, token, file_path, chat_id, statu
             link = text
 
     if not link:
-        raise RuntimeError(f"Не удалось разобрать ответ {display_name}: {resp.text[:300]}")
+        raise RuntimeError(t(lang, "host_link_missing", host=display_name, code=resp.status_code,
+                             body=resp.text[:300] or "<empty>"))
 
     return {"name": file_name, "size": os.path.getsize(file_path), "url": link}
 
@@ -678,11 +895,12 @@ def get_gofile_server():
     data = resp.json()
     servers = (data.get("data") or {}).get("servers") or []
     if not servers:
-        raise RuntimeError(f"Gofile не вернул список серверов: {data}")
+        raise RuntimeError(f"Gofile did not return a server list: {data}")
     return servers[0]["name"]
 
 
 def upload_to_gofile_once(file_path, chat_id, status_msg_id, task_id, control, stage_start):
+    lang = control.lang
     server = get_gofile_server()
     file_name = os.path.basename(file_path)
     file_size = os.path.getsize(file_path)
@@ -701,8 +919,9 @@ def upload_to_gofile_once(file_path, chat_id, status_msg_id, task_id, control, s
 
         if not control.running.is_set():
             if not state["paused_shown"]:
-                text = render_progress("⬆️", "Загрузка на Gofile", monitor.bytes_read, monitor.len, 0,
-                                        time.time() - stage_start, paused=True)
+                text = render_progress("⬆️", t(lang, "uploading_title", host="Gofile"),
+                                        monitor.bytes_read, monitor.len, 0,
+                                        time.time() - stage_start, lang, paused=True)
                 edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
                 state["paused_shown"] = True
             control.running.wait()
@@ -716,7 +935,8 @@ def upload_to_gofile_once(file_path, chat_id, status_msg_id, task_id, control, s
         done = monitor.bytes_read
         dt = now - state["last_time"]
         speed = (done - state["last_done"]) / dt if dt > 0 else 0
-        text = render_progress("⬆️", "Загрузка на Gofile", done, monitor.len, speed, now - stage_start)
+        text = render_progress("⬆️", t(lang, "uploading_title", host="Gofile"), done, monitor.len, speed,
+                                now - stage_start, lang)
         edit_message(chat_id, status_msg_id, text, reply_markup=build_progress_keyboard(task_id, control))
         state["last_edit"] = now
         state["last_done"] = done
@@ -734,11 +954,11 @@ def upload_to_gofile_once(file_path, chat_id, status_msg_id, task_id, control, s
         fh.close()
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"Ошибка Gofile ({resp.status_code}): {resp.text[:300]}")
+        raise RuntimeError(t(lang, "host_http_error", host="Gofile", code=resp.status_code, body=resp.text[:300]))
 
     data = resp.json()
     if data.get("status") != "ok":
-        raise RuntimeError(f"Ошибка Gofile: {data}")
+        raise RuntimeError(f"Gofile error: {data}")
 
     d = data["data"]
     return {"name": d.get("fileName", file_name), "size": file_size, "url": d["downloadPage"]}
@@ -758,6 +978,7 @@ UPLOAD_FUNCS = {
 
 
 def upload_file(dest, file_path, chat_id, status_msg_id, task_id, control):
+    lang = control.lang
     stage_start = time.time()
     upload_once = UPLOAD_FUNCS[dest]
     last_error = None
@@ -772,22 +993,14 @@ def upload_file(dest, file_path, chat_id, status_msg_id, task_id, control):
                 wait_s = min(60, 8 * attempt)
                 edit_message(
                     chat_id, status_msg_id,
-                    f"⚠️ Сбой сети при загрузке (попытка {attempt}/{UPLOAD_RETRIES}), "
-                    f"пробую снова через {wait_s}с...\n"
-                    f"<code>{html_escape(str(e))[:200]}</code>",
+                    t(lang, "retry", attempt=attempt, total=UPLOAD_RETRIES, wait=wait_s,
+                      err=html_escape(str(e))[:200]),
                     reply_markup=build_progress_keyboard(task_id, control),
                 )
                 time.sleep(wait_s)
 
-    hint = ""
-    if dest == "pixeldrain":
-        hint = (
-            "\n\n💡 Похоже, Pixeldrain систематически рвёт соединение (SSL EOF) - "
-            "это часто означает, что сервис ограничивает загрузку с IP-адресов "
-            "дата-центров/CI (какие использует GitHub Actions). Попробуй прислать "
-            "ссылку заново и выбрать <b>VikingFile</b> - он обычно стабильнее в такой среде."
-        )
-    raise RuntimeError(f"Не удалось загрузить после {UPLOAD_RETRIES} попыток: {last_error}{hint}")
+    hint = t(lang, "pixeldrain_hint") if dest == "pixeldrain" else ""
+    raise RuntimeError(t(lang, "upload_failed_final", total=UPLOAD_RETRIES, err=last_error, hint=hint))
 
 
 # ---------------------------------------------------------------------------
@@ -795,13 +1008,13 @@ def upload_file(dest, file_path, chat_id, status_msg_id, task_id, control):
 # ---------------------------------------------------------------------------
 
 def task_worker(chat_id, url, dest, status_msg_id, task_id, control):
+    lang = control.lang
     task_start = time.time()
     file_path = None
     try:
         edit_message(
             chat_id, status_msg_id,
-            f"🎯 <b>Хостинг:</b> {DESTINATIONS[dest]}\n"
-            f"🔗 <code>{html_escape(url)}</code>\n\n⏳ Начинаю скачивание...",
+            t(lang, "target_start", host=DESTINATIONS[dest], url=html_escape(url)),
             reply_markup=build_progress_keyboard(task_id, control),
         )
 
@@ -810,10 +1023,8 @@ def task_worker(chat_id, url, dest, status_msg_id, task_id, control):
 
         edit_message(
             chat_id, status_msg_id,
-            f"✅ <b>Скачивание завершено</b>\n"
-            f"📄 <code>{html_escape(os.path.basename(file_path))}</code>\n"
-            f"📦 {human_size(size)}\n\n"
-            f"⬆️ Начинаю загрузку на {DESTINATIONS[dest]}...",
+            t(lang, "download_done", name=html_escape(os.path.basename(file_path)),
+              size=human_size(size, lang), host=DESTINATIONS[dest]),
             reply_markup=build_progress_keyboard(task_id, control),
         )
 
@@ -822,20 +1033,15 @@ def task_worker(chat_id, url, dest, status_msg_id, task_id, control):
 
         edit_message(
             chat_id, status_msg_id,
-            "🎉 <b>Готово!</b>\n"
-            f"{divider()}\n"
-            f"📄 <b>Файл:</b> <code>{html_escape(result['name'])}</code>\n"
-            f"📦 <b>Размер:</b> {human_size(result['size'])}\n"
-            f"🌐 <b>Хостинг:</b> {DESTINATIONS[dest]}\n"
-            f"🕐 <b>Затрачено времени:</b> {human_time(total_time)}\n"
-            f"{divider()}\n"
-            f"🔗 <b>Ссылка:</b> {result['url']}",
+            t(lang, "done", div=divider(), name=html_escape(result["name"]),
+              size=human_size(result["size"], lang), host=DESTINATIONS[dest],
+              time=human_time(total_time, lang), url=result["url"]),
         )
 
     except TaskStopped:
-        edit_message(chat_id, status_msg_id, "⏹ <b>Остановлено пользователем</b>")
+        edit_message(chat_id, status_msg_id, t(lang, "stopped"))
     except Exception as e:
-        edit_message(chat_id, status_msg_id, f"❌ <b>Ошибка</b>\n<code>{html_escape(str(e))[:500]}</code>")
+        edit_message(chat_id, status_msg_id, t(lang, "error", err=html_escape(str(e))[:500]))
     finally:
         if file_path and os.path.exists(file_path):
             try:
@@ -843,6 +1049,79 @@ def task_worker(chat_id, url, dest, status_msg_id, task_id, control):
             except OSError:
                 pass
         active_controls.pop(chat_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Speedtest
+# ---------------------------------------------------------------------------
+
+def generate_speedtest_file():
+    path = os.path.join(DOWNLOAD_DIR, "speedtest_payload.bin")
+    size = SPEEDTEST_SIZE_MB * 1024 * 1024
+    chunk = os.urandom(1024 * 1024)
+    with open(path, "wb") as f:
+        written = 0
+        while written < size:
+            f.write(chunk)
+            written += len(chunk)
+    return path, size
+
+
+def speedtest_worker(chat_id, status_msg_id, task_id, control):
+    lang = control.lang
+    file_path, size = generate_speedtest_file()
+    results = []
+
+    try:
+        hosts = list(UPLOAD_FUNCS.keys())
+        for i, dest in enumerate(hosts, 1):
+            if control.stopped.is_set():
+                break
+
+            if dest == "pixeldrain" and not PIXELDRAIN_API_KEY:
+                results.append((dest, None, None, t(lang, "speedtest_skip_no_key")))
+                continue
+
+            edit_message(chat_id, status_msg_id,
+                         t(lang, "speedtest_progress", host=DESTINATIONS[dest], i=i, n=len(hosts)))
+            upload_once = UPLOAD_FUNCS[dest]
+            start = time.time()
+            try:
+                upload_once(file_path, chat_id, status_msg_id, task_id, control, start)
+                elapsed = time.time() - start
+                speed = size / elapsed if elapsed > 0 else 0
+                results.append((dest, speed, elapsed, None))
+            except TaskStopped:
+                raise
+            except Exception as e:
+                results.append((dest, None, None, html_escape(str(e))[:150]))
+    except TaskStopped:
+        edit_message(chat_id, status_msg_id, t(lang, "stopped"))
+        active_controls.pop(chat_id, None)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return
+    finally:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+    ranked = sorted(results, key=lambda r: (r[1] is None, -(r[1] or 0)))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [t(lang, "speedtest_title", size=human_size(size, lang), div=divider())]
+    for idx, (dest, speed, elapsed, err) in enumerate(ranked):
+        host = DESTINATIONS[dest]
+        if speed is not None:
+            medal = medals[idx] if idx < len(medals) else "▪️"
+            lines.append(t(lang, "speedtest_row_ok", medal=medal, host=host,
+                            speed=human_size(speed, lang), time=human_time(elapsed, lang)))
+        else:
+            lines.append(t(lang, "speedtest_row_fail", host=host, err=err))
+
+    edit_message(chat_id, status_msg_id, "\n".join(lines))
+    active_controls.pop(chat_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -854,64 +1133,99 @@ def handle_message(message):
 
     chat_id = str(message["chat"]["id"])
     text = (message.get("text") or "").strip()
+    lang = get_lang(chat_id, message.get("from"))
 
     if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
-        send_message(chat_id, "⛔ У вас нет доступа к этому боту.")
+        send_message(chat_id, t(lang, "no_access"))
         return
 
     last_activity_time = time.time()
 
     if text in ("/start", "/help"):
-        send_message(
-            chat_id,
-            "👋 <b>Привет!</b>\n\n"
-            "Пришли мне ссылку на файл — я скачаю его и предложу перезалить "
-            "на <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
-            "<b>BuzzHeavier</b> или <b>Gofile</b> на выбор.\n\n"
-            "На этапе скачивания и загрузки под сообщением с прогрессом будут "
-            "кнопки ⏸ <b>Пауза</b> и ⏹ <b>Стоп</b>.\n\n"
-            "⚙️ <b>Команды</b>\n"
-            "/stop — остановить текущую задачу (аналог кнопки ⏹ Стоп)\n"
-            "/shutdown — полностью завершить работу бота"
-        )
+        send_message(chat_id, t(lang, "start", bot_name=BOT_DISPLAY_NAME))
+        return
+
+    if text == "/language":
+        send_message(chat_id, t(lang, "language_prompt"), reply_markup=build_language_keyboard())
         return
 
     if text == "/stop":
         control = active_controls.get(chat_id)
         if control:
             control.stopped.set()
-            control.running.set()   # разбудить поток, если он ждал на паузе
-            send_message(chat_id, "⏹ Останавливаю текущую задачу...")
+            control.running.set()
+            send_message(chat_id, t(lang, "stop_task"))
         else:
-            send_message(chat_id, "ℹ️ Сейчас нет активной задачи. Чтобы полностью завершить бота, используй /shutdown.")
+            send_message(chat_id, t(lang, "stop_no_task"))
         return
 
     if text == "/shutdown":
-        send_message(chat_id, "🛑 Останавливаю бота полностью...")
+        send_message(chat_id, t(lang, "shutdown"))
         should_stop_bot.set()
         return
 
+    if text == "/speedtest":
+        if chat_id in active_controls:
+            send_message(chat_id, t(lang, "speedtest_busy"))
+            return
+
+        task_id = uuid.uuid4().hex[:8]
+        control = TaskControl(task_id, lang=lang)
+        active_controls[chat_id] = control
+
+        status = send_message(
+            chat_id,
+            t(lang, "speedtest_start", n=len(UPLOAD_FUNCS), size=human_size(SPEEDTEST_SIZE_MB * 1024 * 1024, lang)),
+        )
+        thread = threading.Thread(
+            target=speedtest_worker,
+            args=(chat_id, status["message_id"], task_id, control),
+            daemon=True,
+        )
+        thread.start()
+        return
+
     if chat_id in active_controls:
-        send_message(chat_id, "⏳ Уже выполняется другая задача. Дождись её завершения или отправь /stop.")
+        send_message(chat_id, t(lang, "busy"))
         return
 
     match = URL_RE.search(text)
     if not match:
-        send_message(chat_id, "📎 Пришли, пожалуйста, ссылку на файл (начинается с http:// или https://).")
+        send_message(chat_id, t(lang, "ask_link"))
         return
 
     url = match.group(0)
     token = uuid.uuid4().hex[:8]
 
     size_bytes = get_remote_file_size(url)
-    size_line = f"\n📦 Размер: ~{human_size(size_bytes)}" if size_bytes else ""
+    size_line = t(lang, "size_line", size=human_size(size_bytes, lang)) if size_bytes else ""
 
     status = send_message(
         chat_id,
-        f"🔗 <b>Принял ссылку</b>\n<code>{html_escape(url)}</code>{size_line}\n\nКуда залить файл?",
-        reply_markup=build_target_keyboard(token, size_bytes),
+        t(lang, "link_received", url=html_escape(url), size_line=size_line),
+        reply_markup=build_target_keyboard(token, size_bytes, lang),
     )
     pending_selections[chat_id] = {"token": token, "url": url, "message_id": status["message_id"]}
+
+
+def get_remote_file_size(url):
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=10)
+        size = resp.headers.get("Content-Length")
+        if resp.status_code < 400 and size:
+            return int(size)
+    except requests.RequestException:
+        pass
+
+    try:
+        with requests.get(url, stream=True, timeout=10) as resp:
+            size = resp.headers.get("Content-Length")
+            if resp.status_code < 400 and size:
+                return int(size)
+    except requests.RequestException:
+        pass
+
+    return None
 
 
 def handle_callback_query(cq):
@@ -920,21 +1234,28 @@ def handle_callback_query(cq):
     data = cq.get("data", "")
     chat_id = str(cq["message"]["chat"]["id"])
     message_id = cq["message"]["message_id"]
+    lang = get_lang(chat_id, cq.get("from"))
 
     if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
-        answer_callback(cq["id"], "Нет доступа", show_alert=True)
+        answer_callback(cq["id"], t(lang, "no_access"), show_alert=True)
         return
 
     last_activity_time = time.time()
     parts = data.split("|")
     action = parts[0]
 
+    if action == "lang":
+        new_lang = parts[1] if parts[1] in TEXTS else DEFAULT_LANG
+        user_lang[chat_id] = new_lang
+        answer_callback(cq["id"], t(new_lang, "language_set"))
+        edit_message(chat_id, message_id, t(new_lang, "language_set"))
+        return
+
     if action == "toolarge":
         dest = parts[1]
         answer_callback(
             cq["id"],
-            f"⛔ Файл больше лимита {human_size(PIXELDRAIN_MAX_SIZE_BYTES)} для {DESTINATIONS.get(dest, dest)}. "
-            f"Выбери VikingFile.",
+            t(lang, "toolarge_alert", limit=human_size(PIXELDRAIN_MAX_SIZE_BYTES, lang), host=DESTINATIONS.get(dest, dest)),
             show_alert=True,
         )
         return
@@ -943,18 +1264,18 @@ def handle_callback_query(cq):
         dest, token = parts[1], parts[2]
         pending = pending_selections.get(chat_id)
         if not pending or pending["token"] != token:
-            answer_callback(cq["id"], "Эта кнопка устарела", show_alert=True)
+            answer_callback(cq["id"], t(lang, "stale_button"), show_alert=True)
             return
 
         if dest == "pixeldrain" and not PIXELDRAIN_API_KEY:
-            answer_callback(cq["id"], "Pixeldrain недоступен: не задан PIXELDRAIN_API_KEY", show_alert=True)
+            answer_callback(cq["id"], t(lang, "pixeldrain_unavailable"), show_alert=True)
             return
 
         del pending_selections[chat_id]
-        answer_callback(cq["id"], f"Выбрано: {DESTINATIONS[dest]}")
+        answer_callback(cq["id"], t(lang, "target_chosen", host=DESTINATIONS[dest]))
 
         task_id = uuid.uuid4().hex[:8]
-        control = TaskControl(task_id)
+        control = TaskControl(task_id, lang=lang)
         active_controls[chat_id] = control
 
         thread = threading.Thread(
@@ -968,20 +1289,20 @@ def handle_callback_query(cq):
     if action in ("toggle", "stop"):
         control = active_controls.get(chat_id)
         if not control or control.task_id != parts[1]:
-            answer_callback(cq["id"], "Задача уже завершена", show_alert=True)
+            answer_callback(cq["id"], t(lang, "task_finished_alert"), show_alert=True)
             return
 
         if action == "toggle":
             if control.running.is_set():
                 control.running.clear()
-                answer_callback(cq["id"], "⏸ Пауза")
+                answer_callback(cq["id"], t(control.lang, "pause_alert"))
             else:
                 control.running.set()
-                answer_callback(cq["id"], "▶️ Продолжаю")
+                answer_callback(cq["id"], t(control.lang, "resume_alert"))
         elif action == "stop":
             control.stopped.set()
-            control.running.set()   # разбудить поток, если он ждал на паузе
-            answer_callback(cq["id"], "⏹ Останавливаю задачу...")
+            control.running.set()
+            answer_callback(cq["id"], t(control.lang, "stopping_alert"))
         return
 
     answer_callback(cq["id"])
@@ -1001,21 +1322,24 @@ def handle_update(update):
 def main():
     if not ALLOWED_CHAT_IDS:
         print(
-            "ВНИМАНИЕ: TELEGRAM_ALLOWED_CHAT_IDS не задан. "
-            "Бот будет отвечать любому, кто его найдёт.",
+            "WARNING: TELEGRAM_ALLOWED_CHAT_IDS is not set. "
+            "The bot will respond to anyone who finds it.",
             file=sys.stderr,
         )
     if not PIXELDRAIN_API_KEY:
-        print("Секрет PIXELDRAIN_API_KEY не задан - опция Pixeldrain будет недоступна.", file=sys.stderr)
+        print("PIXELDRAIN_API_KEY is not set - the Pixeldrain option will be unavailable.", file=sys.stderr)
 
-    # На случай, если для бота когда-либо был настроен webhook - он мешает
-    # long polling'у (getUpdates) и вызывает конфликт. Сбрасываем его на всякий случай.
+    try:
+        tg_call("setMyName", name=BOT_DISPLAY_NAME)
+    except Exception as e:
+        print(f"Could not set bot display name (not critical): {e}", file=sys.stderr)
+
     try:
         tg_call("deleteWebhook", drop_pending_updates="false")
     except Exception as e:
-        print(f"Не удалось сбросить webhook (не критично): {e}")
+        print(f"Could not delete webhook (not critical): {e}", file=sys.stderr)
 
-    print("Запускаю aria2c...")
+    print("Starting aria2c...")
     start_aria2c()
 
     def handle_sigterm(signum, frame):
@@ -1025,25 +1349,25 @@ def main():
     signal.signal(signal.SIGINT, handle_sigterm)
 
     offset = 0
-    print("Бот запущен, жду сообщений в Telegram...")
+    print(f"{BOT_DISPLAY_NAME} is running, waiting for Telegram updates...")
 
     try:
         while not should_stop_bot.is_set():
             if time.time() - start_time > HARD_TIMEOUT:
-                print("Достигнут общий лимит времени работы, завершаюсь.")
+                print("Reached overall time limit, shutting down.")
                 break
             if time.time() - last_activity_time > IDLE_TIMEOUT:
-                print("Нет активности слишком долго, завершаюсь.")
+                print("No activity for too long, shutting down.")
                 break
 
             try:
                 updates = get_updates(offset)
             except Exception as e:
                 if "Conflict" in str(e) or "terminated by other" in str(e):
-                    print(f"Конфликт с другим запущенным экземпляром бота (вероятно, предыдущий запуск ещё "
-                          f"не остановился): {e}. Повтор через 5с.")
+                    print(f"Conflict with another running bot instance (previous run may still be "
+                          f"shutting down): {e}. Retrying in 5s.")
                 else:
-                    print(f"Ошибка при опросе Telegram: {e}, повтор через 5с")
+                    print(f"Error while polling Telegram: {e}, retrying in 5s")
                 time.sleep(5)
                 continue
 
@@ -1052,17 +1376,16 @@ def main():
                 try:
                     handle_update(update)
                 except Exception as e:
-                    print(f"Ошибка обработки апдейта: {e}")
+                    print(f"Error handling update: {e}")
 
     finally:
-        # останавливаем все активные задачи перед выходом
         for control in list(active_controls.values()):
             control.stopped.set()
             control.running.set()
         stop_aria2c()
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
-    print("Бот остановлен.")
+    print("Bot stopped.")
 
 
 if __name__ == "__main__":
