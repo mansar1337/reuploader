@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: "10"
+      pixeldrain_max_size_gb:
+        description: "Лимит размера файла для кнопки Pixeldrain (ГБ)"
+        required: false
+        type: string
+        default: "20"
 
 # Если запустить workflow ещё раз, пока предыдущий бот ещё работает,
 # GitHub автоматически отменит старый запуск - это предотвращает конфликт
@@ -34,6 +39,7 @@ jobs:
       VIKINGFILE_USER_HASH: ${{ secrets.VIKINGFILE_USER_HASH }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
       IDLE_TIMEOUT_MINUTES: ${{ github.event.inputs.idle_timeout_minutes }}
+      PIXELDRAIN_MAX_SIZE_GB: ${{ github.event.inputs.pixeldrain_max_size_gb }}
       HARD_TIMEOUT_SECONDS: 20400   # ~340 минут, чуть меньше timeout-minutes выше
 
     steps:
