@@ -16,8 +16,7 @@ Telegram-бот для перезалива файлов на VikingFile или 
 при этом может провиснуть; если хостинг оборвёт его при долгой паузе, бот
 предложит повторить загрузку.
 
-Если новых сообщений нет дольше IDLE_TIMEOUT минут — бот завершает работу
-(IDLE_TIMEOUT_MINUTES=0 или HARD_TIMEOUT_SECONDS=0 отключает соответствующий лимит).
+Если новых сообщений нет дольше IDLE_TIMEOUT минут — бот завершает работу.
 Команда /stop в чате завершает работу бота целиком (не путать с кнопкой "Стоп",
 которая останавливает только текущую задачу).
 """
@@ -49,11 +48,19 @@ ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
 
-# 0 или отрицательное значение = таймаут отключён (бот не завершается сам)
-_idle_min = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "10"))
-IDLE_TIMEOUT = _idle_min * 60 if _idle_min > 0 else 0
-_hard_sec = int(os.environ.get("HARD_TIMEOUT_SECONDS", "20400"))
-HARD_TIMEOUT = _hard_sec if _hard_sec > 0 else 0
+def _env_int(name, default):
+    val = os.environ.get(name, "").strip()
+    return int(val) if val else default
+
+
+def _env_float(name, default):
+    val = os.environ.get(name, "").strip()
+    return float(val) if val else default
+
+
+IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT_MINUTES", 10) * 60
+HARD_TIMEOUT = _env_int("HARD_TIMEOUT_SECONDS", 20400)
+PIXELDRAIN_MAX_SIZE_BYTES = int(_env_float("PIXELDRAIN_MAX_SIZE_GB", 20.0) * 1024 ** 3)
 
 DOWNLOAD_DIR = os.path.abspath("downloads")
 ARIA2_RPC_PORT = 6800
@@ -157,13 +164,44 @@ def get_updates(offset):
 # Клавиатуры
 # ---------------------------------------------------------------------------
 
-def build_target_keyboard(token):
-    return {
-        "inline_keyboard": [[
-            {"text": "🦁 VikingFile", "callback_data": f"target|vikingfile|{token}"},
-            {"text": "🟢 Pixeldrain", "callback_data": f"target|pixeldrain|{token}"},
-        ]]
-    }
+def get_remote_file_size(url):
+    """Пытается узнать размер файла по заголовкам, не скачивая его. Возвращает
+    размер в байтах или None, если узнать не удалось (не критично)."""
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=10)
+        size = resp.headers.get("Content-Length")
+        if resp.status_code < 400 and size:
+            return int(size)
+    except requests.RequestException:
+        pass
+
+    try:
+        with requests.get(url, stream=True, timeout=10) as resp:
+            size = resp.headers.get("Content-Length")
+            if resp.status_code < 400 and size:
+                return int(size)
+    except requests.RequestException:
+        pass
+
+    return None
+
+
+def build_target_keyboard(token, file_size=None):
+    buttons = [{"text": "🦁 VikingFile", "callback_data": f"target|vikingfile|{token}"}]
+
+    pixeldrain_too_large = (
+        file_size is not None
+        and file_size > PIXELDRAIN_MAX_SIZE_BYTES
+    )
+    if pixeldrain_too_large:
+        buttons.append({
+            "text": f"🟢 Pixeldrain ⛔ >{human_size(PIXELDRAIN_MAX_SIZE_BYTES)}",
+            "callback_data": f"toolarge|pixeldrain|{token}",
+        })
+    else:
+        buttons.append({"text": "🟢 Pixeldrain", "callback_data": f"target|pixeldrain|{token}"})
+
+    return {"inline_keyboard": [buttons]}
 
 
 def build_progress_keyboard(task_id, control):
@@ -668,17 +706,28 @@ def handle_message(message):
             "На этапе скачивания и загрузки под сообщением с прогрессом будут "
             "кнопки ⏸ <b>Пауза</b> и ⏹ <b>Стоп</b>.\n\n"
             "⚙️ <b>Команды</b>\n"
-            "/stop — полностью завершить работу бота"
+            "/stop — остановить текущую задачу (аналог кнопки ⏹ Стоп)\n"
+            "/shutdown — полностью завершить работу бота"
         )
         return
 
     if text == "/stop":
-        send_message(chat_id, "🛑 Останавливаюсь...")
+        control = active_controls.get(chat_id)
+        if control:
+            control.stopped.set()
+            control.running.set()   # разбудить поток, если он ждал на паузе
+            send_message(chat_id, "⏹ Останавливаю текущую задачу...")
+        else:
+            send_message(chat_id, "ℹ️ Сейчас нет активной задачи. Чтобы полностью завершить бота, используй /shutdown.")
+        return
+
+    if text == "/shutdown":
+        send_message(chat_id, "🛑 Останавливаю бота полностью...")
         should_stop_bot.set()
         return
 
     if chat_id in active_controls:
-        send_message(chat_id, "⏳ Уже выполняется другая задача. Дождись её завершения или нажми ⏹ Стоп под её сообщением.")
+        send_message(chat_id, "⏳ Уже выполняется другая задача. Дождись её завершения или отправь /stop.")
         return
 
     match = URL_RE.search(text)
@@ -688,10 +737,14 @@ def handle_message(message):
 
     url = match.group(0)
     token = uuid.uuid4().hex[:8]
+
+    size_bytes = get_remote_file_size(url)
+    size_line = f"\n📦 Размер: ~{human_size(size_bytes)}" if size_bytes else ""
+
     status = send_message(
         chat_id,
-        f"🔗 <b>Принял ссылку</b>\n<code>{html_escape(url)}</code>\n\nКуда залить файл?",
-        reply_markup=build_target_keyboard(token),
+        f"🔗 <b>Принял ссылку</b>\n<code>{html_escape(url)}</code>{size_line}\n\nКуда залить файл?",
+        reply_markup=build_target_keyboard(token, size_bytes),
     )
     pending_selections[chat_id] = {"token": token, "url": url, "message_id": status["message_id"]}
 
@@ -710,6 +763,16 @@ def handle_callback_query(cq):
     last_activity_time = time.time()
     parts = data.split("|")
     action = parts[0]
+
+    if action == "toolarge":
+        dest = parts[1]
+        answer_callback(
+            cq["id"],
+            f"⛔ Файл больше лимита {human_size(PIXELDRAIN_MAX_SIZE_BYTES)} для {DESTINATIONS.get(dest, dest)}. "
+            f"Выбери VikingFile.",
+            show_alert=True,
+        )
+        return
 
     if action == "target":
         dest, token = parts[1], parts[2]
@@ -799,18 +862,12 @@ def main():
     offset = 0
     print("Бот запущен, жду сообщений в Telegram...")
 
-    # Сбрасываем таймер активности уже после старта aria2c и webhook,
-    # иначе при IDLE_TIMEOUT_MINUTES=0 (или очень маленьком) бот сразу
-    # завершается, не успев сделать даже первый long-poll.
-    global last_activity_time
-    last_activity_time = time.time()
-
     try:
         while not should_stop_bot.is_set():
-            if HARD_TIMEOUT and time.time() - start_time > HARD_TIMEOUT:
+            if time.time() - start_time > HARD_TIMEOUT:
                 print("Достигнут общий лимит времени работы, завершаюсь.")
                 break
-            if IDLE_TIMEOUT and time.time() - last_activity_time > IDLE_TIMEOUT:
+            if time.time() - last_activity_time > IDLE_TIMEOUT:
                 print("Нет активности слишком долго, завершаюсь.")
                 break
 
