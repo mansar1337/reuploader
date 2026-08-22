@@ -31,6 +31,7 @@ import signal
 import threading
 import subprocess
 import uuid
+import mimetypes
 from html import escape as html_escape
 from urllib.parse import quote, urljoin
 
@@ -69,6 +70,7 @@ IDLE_TIMEOUT = _env_int("IDLE_TIMEOUT_MINUTES", 10) * 60
 HARD_TIMEOUT = _env_int("HARD_TIMEOUT_SECONDS", 20400)
 PIXELDRAIN_MAX_SIZE_BYTES = int(_env_float("PIXELDRAIN_MAX_SIZE_GB", 20.0) * 1024 ** 3)
 SPEEDTEST_SIZE_MB = _env_int("SPEEDTEST_SIZE_MB", 100)
+TG_FILE_MAX_SIZE = 20 * 1024 * 1024  # Telegram Bot API getFile download limit
 
 DOWNLOAD_DIR = os.path.abspath("downloads")
 ARIA2_RPC_PORT = 6800
@@ -123,7 +125,7 @@ TEXTS = {
     "ru": {
         "start": (
             "👋 <b>Привет! Я {bot_name}.</b>\n\n"
-            "Пришли мне ссылку на файл — я скачаю его и предложу перезалить "
+            "Пришли мне ссылку на файл или сам файл (документом) — я скачаю его и предложу перезалить "
             "на <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
             "<b>BuzzHeavier</b> и/или <b>Gofile</b> — можно выбрать сразу несколько, "
             "файл скачается один раз, а зальётся по очереди на все выбранные хостинги.\n\n"
@@ -140,9 +142,11 @@ TEXTS = {
         "stop_no_task": "ℹ️ Сейчас нет активной задачи. Чтобы полностью завершить бота, используй /shutdown.",
         "shutdown": "🛑 Останавливаю бота полностью...",
         "busy": "⏳ Уже выполняется другая задача. Дождись её завершения или отправь /stop.",
-        "ask_link": "📎 Пришли, пожалуйста, ссылку на файл (начинается с http:// или https://).",
+        "ask_link": "📎 Пришли ссылку на файл (начинается с http:// или https://) или сам файл (документом).",
         "size_line": "\n📦 Размер: ~{size}",
         "link_received": "🔗 <b>Принял ссылку</b>\n<code>{url}</code>{size_line}\n\nВыбери хостинги (можно несколько), затем нажми «Начать».",
+        "file_received": "📎 <b>Принял файл</b>\n<code>{url}</code>{size_line}\n\nВыбери хостинги (можно несколько), затем нажми «Начать».",
+        "tg_file_too_large": "⛔ Файл слишком большой для скачивания через Telegram Bot API (максимум {limit}). Пришли ссылку на файл вместо самого файла.",
         "stale_button": "Эта кнопка устарела",
         "pixeldrain_unavailable": "Pixeldrain недоступен: не задан PIXELDRAIN_API_KEY",
         "toolarge_alert": "⛔ Файл больше лимита {limit} для {host}. Выбери другой хостинг, например VikingFile.",
@@ -220,7 +224,7 @@ TEXTS = {
     "en": {
         "start": (
             "👋 <b>Hi! I'm {bot_name}.</b>\n\n"
-            "Send me a link to a file — I'll download it and let you re-upload it "
+            "Send me a link to a file or the file itself as a document — I'll download it and let you re-upload it "
             "to <b>VikingFile</b>, <b>Pixeldrain</b>, <b>FuckingFast</b>, "
             "<b>BuzzHeavier</b> and/or <b>Gofile</b> — you can pick several at once, "
             "the file is downloaded once and then uploaded to each selected host in turn.\n\n"
@@ -237,9 +241,11 @@ TEXTS = {
         "stop_no_task": "ℹ️ No active task right now. To fully shut down the bot, use /shutdown.",
         "shutdown": "🛑 Shutting down the bot completely...",
         "busy": "⏳ Another task is already running. Wait for it to finish or send /stop.",
-        "ask_link": "📎 Please send a link to a file (starting with http:// or https://).",
+        "ask_link": "📎 Send a link to a file (starting with http:// or https://) or the file itself as a document.",
         "size_line": "\n📦 Size: ~{size}",
         "link_received": "🔗 <b>Link received</b>\n<code>{url}</code>{size_line}\n\nChoose hosting services (you can select several), then press Start.",
+        "file_received": "📎 <b>File received</b>\n<code>{url}</code>{size_line}\n\nChoose hosting services (you can select several), then press Start.",
+        "tg_file_too_large": "⛔ File is too large to download via Telegram Bot API (max {limit}). Send a link to the file instead.",
         "stale_button": "This button has expired",
         "pixeldrain_unavailable": "Pixeldrain unavailable: PIXELDRAIN_API_KEY is not set",
         "toolarge_alert": "⛔ File exceeds the {limit} limit for {host}. Pick another host, e.g. VikingFile.",
@@ -350,10 +356,12 @@ def get_lang(chat_id, tg_user=None):
 
 def tg_call(method, **params):
     resp = requests.post(f"{TELEGRAM_API}/{method}", data=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Telegram API error in {method}: HTTP {resp.status_code} {resp.text[:300]}")
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error in {method}: {data}")
+        raise RuntimeError(f"Telegram API error in {method}: {data.get('description', data)}")
     return data["result"]
 
 
@@ -395,10 +403,12 @@ def get_updates(offset):
         },
         timeout=35,
     )
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Telegram API error in getUpdates: HTTP {resp.status_code} {resp.text[:300]}")
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error in getUpdates: {data}")
+        raise RuntimeError(f"Telegram API error in getUpdates: {data.get('description', data)}")
     return data["result"]
 
 
@@ -686,6 +696,116 @@ def download_with_progress(url, chat_id, status_msg_id, task_id, control):
             time.sleep(1)
     finally:
         control.gid = None
+
+
+# ---------------------------------------------------------------------------
+# Скачивание файла, присланного пользователем прямо в Telegram
+# ---------------------------------------------------------------------------
+
+def _build_file_info(media, media_type):
+    file_id = media["file_id"]
+    file_name = media.get("file_name")
+    if not file_name:
+        if media_type == "photo":
+            ext = ".jpg"
+        elif media_type == "voice":
+            ext = ".ogg"
+        elif media_type == "video_note":
+            ext = ".mp4"
+        elif media_type == "sticker":
+            ext = ".webp"
+        else:
+            ext = mimetypes.guess_extension(media.get("mime_type", "")) or ""
+        uid = media.get("file_unique_id") or file_id[-12:]
+        file_name = f"{media_type}_{uid}{ext}"
+    return {
+        "file_id": file_id,
+        "file_name": file_name,
+        "file_size": media.get("file_size", 0),
+    }
+
+
+def extract_tg_file(message):
+    for key in ("document", "video", "audio", "animation", "voice", "video_note", "sticker"):
+        media = message.get(key)
+        if media and "file_id" in media:
+            return _build_file_info(media, key)
+    photo = message.get("photo")
+    if photo:
+        return _build_file_info(photo[-1], "photo")
+    return None
+
+
+def download_tg_file(source, chat_id, status_msg_id, task_id, control):
+    lang = control.lang
+    file_id = source["file_id"]
+    file_name = source["file_name"]
+    expected_size = source.get("file_size", 0)
+
+    result = tg_call("getFile", file_id=file_id)
+    file_path_tg = result["file_path"]
+    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path_tg}"
+
+    safe_name = os.path.basename(file_name) or f"tg_{file_id[-12:]}"
+    local_path = os.path.join(DOWNLOAD_DIR, safe_name)
+    if os.path.exists(local_path):
+        base, ext = os.path.splitext(safe_name)
+        local_path = os.path.join(DOWNLOAD_DIR, f"{base}_{uuid.uuid4().hex[:4]}{ext}")
+
+    last_edit_time = 0
+    last_done = 0
+    last_time = time.time()
+    stage_start = time.time()
+    paused_shown = False
+
+    resp = requests.get(download_url, stream=True, timeout=(30, 60))
+    try:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Telegram file download failed (HTTP {resp.status_code}): {resp.text[:300]}")
+        total = int(resp.headers.get("Content-Length", 0)) or expected_size
+        with open(local_path, "wb") as f:
+            done = 0
+            for chunk in resp.iter_content(131072):
+                if control.stopped.is_set():
+                    raise TaskStopped()
+
+                if not control.running.is_set():
+                    if not paused_shown:
+                        text = render_progress("⬇️", t(lang, "downloading_title"), done, total, 0,
+                                                time.time() - stage_start, lang, paused=True)
+                        edit_message(chat_id, status_msg_id, text,
+                                     reply_markup=build_progress_keyboard(task_id, control))
+                        paused_shown = True
+                    control.running.wait(timeout=1)
+                    continue
+                else:
+                    paused_shown = False
+
+                f.write(chunk)
+                done += len(chunk)
+
+                now = time.time()
+                if now - last_edit_time >= 3:
+                    dt = now - last_time
+                    speed = (done - last_done) / dt if dt > 0 else 0
+                    text = render_progress("⬇️", t(lang, "downloading_title"), done, total, speed,
+                                            now - stage_start, lang)
+                    edit_message(chat_id, status_msg_id, text,
+                                 reply_markup=build_progress_keyboard(task_id, control))
+                    last_edit_time = now
+                    last_done = done
+                    last_time = now
+    except BaseException:
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        resp.close()
+
+    return local_path
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1150,10 @@ def upload_to_gofile_once(file_path, chat_id, status_msg_id, task_id, control, s
         raise RuntimeError(f"Gofile error: {data}")
 
     d = data["data"]
-    return {"name": d.get("fileName", file_name), "size": file_size, "url": d["downloadPage"]}
+    download_page = d.get("downloadPage") or d.get("downloadLink") or d.get("url")
+    if not download_page:
+        raise RuntimeError(f"Gofile error: no download link in response: {data}")
+    return {"name": d.get("fileName", file_name), "size": file_size, "url": download_page}
 
 
 # ---------------------------------------------------------------------------
@@ -1139,12 +1262,15 @@ def render_overview(lang, dest_list, results, in_progress=None, stopped=False):
     return "\n".join(lines)
 
 
-def multi_task_worker(chat_id, url, dest_list, overview_msg_id, progress_msg_id, task_id, control):
+def multi_task_worker(chat_id, source, dest_list, overview_msg_id, progress_msg_id, task_id, control):
     lang = control.lang
     file_path = None
     results = {}
     try:
-        file_path = download_with_progress(url, chat_id, progress_msg_id, task_id, control)
+        if source["type"] == "url":
+            file_path = download_with_progress(source["url"], chat_id, progress_msg_id, task_id, control)
+        else:
+            file_path = download_tg_file(source, chat_id, progress_msg_id, task_id, control)
         size = os.path.getsize(file_path)
 
         edit_message(
@@ -1326,7 +1452,35 @@ def handle_message(message):
         send_message(chat_id, t(lang, "busy"))
         return
 
-    match = URL_RE.search(text)
+    tg_file = extract_tg_file(message)
+    if tg_file:
+        file_size = tg_file.get("file_size", 0)
+        if file_size > TG_FILE_MAX_SIZE:
+            send_message(chat_id, t(lang, "tg_file_too_large", limit=human_size(TG_FILE_MAX_SIZE, lang)))
+            return
+
+        token = uuid.uuid4().hex[:8]
+        size_bytes = file_size if file_size else None
+        size_line = t(lang, "size_line", size=human_size(size_bytes, lang)) if size_bytes else ""
+        display_name = html_escape(tg_file["file_name"])
+
+        selected = set()
+        status = send_message(
+            chat_id,
+            t(lang, "file_received", url=display_name, size_line=size_line),
+            reply_markup=build_multiselect_keyboard(token, selected, size_bytes, lang),
+        )
+        pending_selections[chat_id] = {
+            "token": token, "url": tg_file["file_name"], "message_id": status["message_id"],
+            "selected": selected, "size": size_bytes, "size_line": size_line,
+            "text_key": "file_received",
+            "source": {"type": "tg", "file_id": tg_file["file_id"],
+                       "file_name": tg_file["file_name"], "file_size": file_size},
+        }
+        return
+
+    search_text = text or (message.get("caption") or "").strip()
+    match = URL_RE.search(search_text)
     if not match:
         send_message(chat_id, t(lang, "ask_link"))
         return
@@ -1346,6 +1500,8 @@ def handle_message(message):
     pending_selections[chat_id] = {
         "token": token, "url": url, "message_id": status["message_id"],
         "selected": selected, "size": size_bytes, "size_line": size_line,
+        "text_key": "link_received",
+        "source": {"type": "url", "url": url},
     }
 
 
@@ -1421,7 +1577,7 @@ def handle_callback_query(cq):
         answer_callback(cq["id"])
         edit_message(
             chat_id, message_id,
-            t(lang, "link_received", url=html_escape(pending["url"]), size_line=pending["size_line"]),
+            t(lang, pending.get("text_key", "link_received"), url=html_escape(pending["url"]), size_line=pending["size_line"]),
             reply_markup=build_multiselect_keyboard(token, selected, pending["size"], lang),
         )
         return
@@ -1450,7 +1606,7 @@ def handle_callback_query(cq):
         answer_callback(cq["id"])
         edit_message(
             chat_id, message_id,
-            t(lang, "link_received", url=html_escape(pending["url"]), size_line=pending["size_line"]),
+            t(lang, pending.get("text_key", "link_received"), url=html_escape(pending["url"]), size_line=pending["size_line"]),
             reply_markup=build_multiselect_keyboard(token, selected, size_bytes, lang),
         )
         return
@@ -1485,7 +1641,7 @@ def handle_callback_query(cq):
 
         thread = threading.Thread(
             target=multi_task_worker,
-            args=(chat_id, pending["url"], dest_list, message_id, progress_status["message_id"], task_id, control),
+            args=(chat_id, pending["source"], dest_list, message_id, progress_status["message_id"], task_id, control),
             daemon=True,
         )
         thread.start()
